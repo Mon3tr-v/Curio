@@ -20,6 +20,47 @@ func TestSubtitleTargetUsesChineseLanguageSuffix(t *testing.T) {
 	}
 }
 
+func TestSubtitleTargetUsesCompactAnimeSubtitleTags(t *testing.T) {
+	counts := map[string]int{}
+	simplified := subtitleTarget("/library/Apocalypse Hotel - S01E01.mkv", scanner.Sidecar{
+		Path:      "/incoming/[Nekomoe kissaten] Apocalypse Hotel [01].JPSC.ass",
+		Name:      "[Nekomoe kissaten] Apocalypse Hotel [01].JPSC.ass",
+		Extension: "ass",
+	}, counts)
+	if !strings.HasSuffix(simplified, ".chs.ass") {
+		t.Fatalf("expected JPSC to become simplified suffix, got %s", simplified)
+	}
+
+	traditional := subtitleTarget("/library/Apocalypse Hotel - S01E01.mkv", scanner.Sidecar{
+		Path:      "/incoming/[Nekomoe kissaten] Apocalypse Hotel [01].JPTC.ass",
+		Name:      "[Nekomoe kissaten] Apocalypse Hotel [01].JPTC.ass",
+		Extension: "ass",
+	}, counts)
+	if !strings.HasSuffix(traditional, ".cht.ass") {
+		t.Fatalf("expected JPTC to become traditional suffix, got %s", traditional)
+	}
+}
+
+func TestSubtitleTargetUsesLanguageDirectoryHint(t *testing.T) {
+	counts := map[string]int{}
+	target := subtitleTarget("/library/Show - S01E01.mkv", scanner.Sidecar{
+		Path:      "/incoming/Show/Subs/繁體/Show - S01E01.ass",
+		Name:      "Show - S01E01.ass",
+		Extension: "ass",
+	}, counts)
+	if !strings.HasSuffix(target, ".cht.ass") {
+		t.Fatalf("expected directory language hint, got %s", target)
+	}
+}
+
+func TestSubtitleTargetIgnoresEmbeddedSCLetters(t *testing.T) {
+	counts := map[string]int{}
+	target := subtitleTarget("/library/Show - S01E01.mkv", scanner.Sidecar{Name: "discussion.ass", Extension: "ass"}, counts)
+	if strings.HasSuffix(target, ".chs.ass") || strings.HasSuffix(target, ".cht.ass") {
+		t.Fatalf("expected no language suffix from embedded letters, got %s", target)
+	}
+}
+
 func TestSubtitleTargetKeepsDuplicateSubtitles(t *testing.T) {
 	counts := map[string]int{}
 	first := subtitleTarget("/library/Movie.mkv", scanner.Sidecar{Name: "Movie.zh-CN.srt", Extension: "srt"}, counts)

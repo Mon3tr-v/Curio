@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"curio/internal/classifier"
 	"curio/internal/clouddrive"
@@ -54,12 +57,30 @@ type RearchiveOptions struct {
 	EpisodeOffset int
 }
 
+type RearchiveFailure struct {
+	FileID  string `json:"file_id"`
+	Message string `json:"message"`
+}
+
 var ErrTaskAlreadyRunning = errors.New("已有扫描任务正在运行")
 var ErrTaskNotFound = errors.New("没有正在运行的任务")
+var ErrCloudDriveNotReady = errors.New("CloudDrive2 未就绪")
+
+const scanFileConcurrency = 2
 
 var (
-	chsSubtitleRE = regexp.MustCompile(`(?i)(^|[ ._\-\[\]()])(?:chs|sc|zh[-_]?cn|zh[-_]?sg|zh[-_]?hans|hans|gb2312|gbk|简体|简中)(?:$|[ ._\-\[\]()])`)
-	chtSubtitleRE = regexp.MustCompile(`(?i)(^|[ ._\-\[\]()])(?:cht|tc|zh[-_]?tw|zh[-_]?hk|zh[-_]?hant|hant|big5|繁体|繁中)(?:$|[ ._\-\[\]()])`)
+	chsSubtitleRE     = regexp.MustCompile(`(?i)(^|[ ._\-\[\]()])(?:chs|sc|zh[-_]?cn|zh[-_]?sg|zh[-_]?hans|hans|gb2312|gbk|简体|简中)(?:$|[ ._\-\[\]()])`)
+	chtSubtitleRE     = regexp.MustCompile(`(?i)(^|[ ._\-\[\]()])(?:cht|tc|zh[-_]?tw|zh[-_]?hk|zh[-_]?hant|hant|big5|繁体|繁中)(?:$|[ ._\-\[\]()])`)
+	chsSubtitleTokens = map[string]struct{}{
+		"chs": {}, "sc": {}, "hans": {}, "gb": {}, "gbk": {}, "gb2312": {}, "gb18030": {},
+		"zhcn": {}, "zhsg": {}, "zhhans": {}, "jpsc": {}, "jpchs": {}, "jpschs": {},
+		"scjp": {}, "chsjp": {}, "jphans": {}, "simplified": {},
+	}
+	chtSubtitleTokens = map[string]struct{}{
+		"cht": {}, "tc": {}, "hant": {}, "big5": {},
+		"zhtw": {}, "zhhk": {}, "zhmo": {}, "zhhant": {}, "jptc": {}, "jpcht": {}, "jptcht": {},
+		"tcjp": {}, "chtjp": {}, "jphant": {}, "traditional": {},
+	}
 )
 
 func New(store *repository.Store, scraperClient *scraper.Client, checker *collection.Checker, redisClient *redis.Client) *Service {
@@ -87,6 +108,9 @@ func (s *Service) StartCloudDriveScan(ctx context.Context) (string, error) {
 	settings, err := s.store.CloudDriveSettings(ctx)
 	if err != nil {
 		return "", err
+	}
+	if err := s.checkCloudDrive(ctx, settings); err != nil {
+		return "", fmt.Errorf("%w：%v", ErrCloudDriveNotReady, err)
 	}
 	systemSettings, err := s.store.Settings(ctx)
 	if err != nil {
@@ -197,19 +221,21 @@ func (s *Service) RearchiveByTMDBID(ctx context.Context, fileID string, tmdbID i
 	return s.RearchiveMedia(ctx, fileID, RearchiveOptions{TMDBID: tmdbID})
 }
 
-func (s *Service) RearchiveMediaBatch(ctx context.Context, fileIDs []string, options RearchiveOptions) ([]models.MediaFile, error) {
+func (s *Service) RearchiveMediaBatch(ctx context.Context, fileIDs []string, options RearchiveOptions) ([]models.MediaFile, []RearchiveFailure, error) {
 	files := make([]models.MediaFile, 0, len(fileIDs))
+	failures := make([]RearchiveFailure, 0)
 	for _, fileID := range fileIDs {
 		if err := ctx.Err(); err != nil {
-			return files, err
+			return files, failures, err
 		}
 		file, err := s.RearchiveMedia(ctx, fileID, options)
 		if err != nil {
-			return files, fmt.Errorf("%s: %w", fileID, err)
+			failures = append(failures, RearchiveFailure{FileID: fileID, Message: err.Error()})
+			continue
 		}
 		files = append(files, file)
 	}
-	return files, nil
+	return files, failures, nil
 }
 
 func (s *Service) RearchiveMedia(ctx context.Context, fileID string, options RearchiveOptions) (models.MediaFile, error) {
@@ -386,25 +412,22 @@ func (s *Service) Recover(ctx context.Context) error {
 
 func (s *Service) runBatch(ctx context.Context, batchID string, dirs models.DirectoryConfig, classificationYAML string) {
 	defer s.finishActive(batchID)
-	err := s.withQueue(ctx, "queue:scan", batchID, func() error {
-		if err := s.store.SetBatchStatus(ctx, batchID, models.BatchStatusRunning); err != nil && ctx.Err() == nil {
-			return err
-		}
-		files, err := scanner.Scan(ctx, dirs.IncomingPath)
-		if err != nil {
-			return err
-		}
-		_ = s.store.SetBatchTotal(ctx, batchID, len(files))
-		_ = s.progress(ctx, batchID)
-		for _, scanned := range files {
-			if err := ctx.Err(); err != nil {
+	err := s.runSafely(batchID, func() error {
+		return s.withQueue(ctx, "queue:scan", batchID, func() error {
+			if err := s.store.SetBatchStatus(ctx, batchID, models.BatchStatusRunning); err != nil && ctx.Err() == nil {
 				return err
 			}
-			if err := s.processFile(ctx, batchID, dirs, scanned, classificationYAML, nil); err != nil && ctx.Err() != nil {
+			files, err := scanner.Scan(ctx, dirs.IncomingPath)
+			if err != nil {
 				return err
 			}
-		}
-		return s.progress(ctx, batchID)
+			_ = s.store.SetBatchTotal(ctx, batchID, len(files))
+			_ = s.progress(ctx, batchID)
+			if err := s.processFiles(ctx, batchID, dirs, files, classificationYAML, nil); err != nil {
+				return err
+			}
+			return s.progress(ctx, batchID)
+		})
 	})
 	s.finishBatch(ctx, batchID, err)
 }
@@ -412,32 +435,118 @@ func (s *Service) runBatch(ctx context.Context, batchID string, dirs models.Dire
 func (s *Service) runCloudDriveBatch(ctx context.Context, batchID string, settings models.CloudDriveSettings, classificationYAML string) {
 	dirs := cloudDriveDirs(settings)
 	defer s.finishActive(batchID)
-	err := s.withQueue(ctx, "queue:scan", batchID, func() error {
-		if err := s.store.SetBatchStatus(ctx, batchID, models.BatchStatusRunning); err != nil && ctx.Err() == nil {
-			return err
-		}
-		drive, err := clouddrive.New(settings).Open(ctx)
-		if err != nil {
-			return err
-		}
-		defer drive.Close()
-		files, err := drive.Scan(ctx, settings.RootPath)
-		if err != nil {
-			return err
-		}
-		_ = s.store.SetBatchTotal(ctx, batchID, len(files))
-		_ = s.progress(ctx, batchID)
-		for _, scanned := range files {
-			if err := ctx.Err(); err != nil {
+	err := s.runSafely(batchID, func() error {
+		return s.withQueue(ctx, "queue:scan", batchID, func() error {
+			if err := s.store.SetBatchStatus(ctx, batchID, models.BatchStatusRunning); err != nil && ctx.Err() == nil {
 				return err
 			}
-			if err := s.processFile(ctx, batchID, dirs, scanned, classificationYAML, drive); err != nil && ctx.Err() != nil {
+			drive, err := clouddrive.New(settings).Open(ctx)
+			if err != nil {
 				return err
 			}
-		}
-		return s.progress(ctx, batchID)
+			defer drive.Close()
+			files, err := drive.Scan(ctx, settings.RootPath, settings.StagingPath, settings.FailedPath, settings.IncompleteCollectionsPath)
+			if err != nil {
+				return err
+			}
+			_ = s.store.SetBatchTotal(ctx, batchID, len(files))
+			_ = s.progress(ctx, batchID)
+			if err := s.processFiles(ctx, batchID, dirs, files, classificationYAML, drive); err != nil {
+				return err
+			}
+			return s.progress(ctx, batchID)
+		})
 	})
 	s.finishBatch(ctx, batchID, err)
+}
+
+func (s *Service) processFiles(ctx context.Context, batchID string, dirs models.DirectoryConfig, files []scanner.File, classificationYAML string, drive *clouddrive.DriveSession) error {
+	if len(files) == 0 {
+		return nil
+	}
+	workers := scanFileConcurrency
+	if len(files) < workers {
+		workers = len(files)
+	}
+	jobs := make(chan scanner.File)
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for scanned := range jobs {
+				if err := ctx.Err(); err != nil {
+					sendFirstErr(errs, err)
+					return
+				}
+				if err := s.processFile(ctx, batchID, dirs, scanned, classificationYAML, drive); isContextStopped(ctx, err) {
+					sendFirstErr(errs, err)
+					return
+				}
+			}
+		}()
+	}
+	for _, scanned := range files {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return ctx.Err()
+		case jobs <- scanned:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	select {
+	case err := <-errs:
+		return err
+	default:
+		return nil
+	}
+}
+
+func sendFirstErr(errs chan<- error, err error) {
+	if err == nil {
+		return
+	}
+	select {
+	case errs <- err:
+	default:
+	}
+}
+
+func (s *Service) runSafely(batchID string, fn func() error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("任务异常退出：%v", recovered)
+			log.Printf("batch %s panic: %v\n%s", batchID, recovered, debug.Stack())
+		}
+	}()
+	return fn()
+}
+
+func (s *Service) checkCloudDrive(ctx context.Context, settings models.CloudDriveSettings) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	drive, err := clouddrive.New(settings).Open(ctx)
+	if err != nil {
+		return fmt.Errorf("连接失败：%w%s", err, cloudDriveAddressHint(settings.Address))
+	}
+	defer drive.Close()
+	root := clouddrive.NormalizePath(settings.RootPath)
+	if _, err := drive.List(ctx, root); err != nil {
+		return fmt.Errorf("读取根目录 %s 失败：%w%s", root, err, cloudDriveAddressHint(settings.Address))
+	}
+	return nil
+}
+
+func cloudDriveAddressHint(address string) string {
+	value := strings.ToLower(strings.TrimSpace(address))
+	if strings.Contains(value, "localhost") || strings.Contains(value, "127.0.0.1") || strings.Contains(value, "::1") {
+		return "；当前 CloudDrive2 地址指向容器自身，在 NAS Docker 中请改为 http://host.docker.internal:19798 或 http://100.66.1.1:19798"
+	}
+	return ""
 }
 
 func (s *Service) finishActive(batchID string) {
@@ -1157,6 +1266,7 @@ func (s *Service) finishMovedMedia(ctx context.Context, file models.MediaFile, t
 			message := err.Error()
 			if verified {
 				message = "文件已移动到目标路径，但数据库状态更新失败：" + message
+				_ = s.store.UpdateMediaFailure(ctx, file.ID, movedPath, movedPath, models.ErrDatabaseWriteFailed, message)
 			}
 			_ = s.store.FinishTask(ctx, taskID, models.StatusFailed, models.ErrDatabaseWriteFailed, message)
 			_ = s.store.IncrementBatch(ctx, file.BatchID, models.StatusFailed)
@@ -1233,7 +1343,7 @@ func subtitleTarget(mediaTarget string, sidecar scanner.Sidecar, counts map[stri
 	}
 	base := strings.TrimSuffix(mediaTarget, mediaExt)
 	ext := "." + strings.TrimPrefix(strings.ToLower(sidecar.Extension), ".")
-	lang := subtitleLanguageSuffix(sidecar.Name)
+	lang := subtitleLanguageSuffix(sidecar)
 	key := lang + ext
 	counts[key]++
 	if counts[key] > 1 {
@@ -1242,16 +1352,65 @@ func subtitleTarget(mediaTarget string, sidecar scanner.Sidecar, counts map[stri
 	return base + lang + ext
 }
 
-func subtitleLanguageSuffix(name string) string {
-	value := strings.ToLower(name)
+func subtitleLanguageSuffix(sidecar scanner.Sidecar) string {
+	if suffix := subtitleLanguageSuffixFromText(sidecar.Name); suffix != "" {
+		return suffix
+	}
+	return subtitleLanguageSuffixFromText(sidecar.Path)
+}
+
+func subtitleLanguageSuffixFromText(text string) string {
+	value := strings.ToLower(text)
+	chs := hasSimplifiedSubtitleHint(value)
+	cht := hasTraditionalSubtitleHint(value)
 	switch {
-	case chsSubtitleRE.MatchString(value):
+	case chs && !cht:
 		return ".chs"
-	case chtSubtitleRE.MatchString(value):
+	case cht && !chs:
 		return ".cht"
 	default:
 		return ""
 	}
+}
+
+func hasSimplifiedSubtitleHint(value string) bool {
+	if chsSubtitleRE.MatchString(value) ||
+		strings.Contains(value, "简体") ||
+		strings.Contains(value, "簡體") ||
+		strings.Contains(value, "简中") ||
+		strings.Contains(value, "簡中") ||
+		strings.Contains(value, "简日") ||
+		strings.Contains(value, "日简") {
+		return true
+	}
+	return hasSubtitleToken(value, chsSubtitleTokens)
+}
+
+func hasTraditionalSubtitleHint(value string) bool {
+	if chtSubtitleRE.MatchString(value) ||
+		strings.Contains(value, "繁体") ||
+		strings.Contains(value, "繁體") ||
+		strings.Contains(value, "繁中") ||
+		strings.Contains(value, "繁日") ||
+		strings.Contains(value, "日繁") {
+		return true
+	}
+	return hasSubtitleToken(value, chtSubtitleTokens)
+}
+
+func hasSubtitleToken(value string, accepted map[string]struct{}) bool {
+	for _, token := range subtitleTokens(value) {
+		if _, ok := accepted[token]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func subtitleTokens(value string) []string {
+	return strings.FieldsFunc(value, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
 }
 
 func (s *Service) migrateCompleteCloudCollection(ctx context.Context, dirs models.DirectoryConfig, result scraper.Result, values map[string]string) {

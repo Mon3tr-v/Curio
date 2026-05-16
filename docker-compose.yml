@@ -1,58 +1,54 @@
 services:
   db:
     image: postgres:17-alpine
+    container_name: curio-db
+    restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
       POSTGRES_DB: curio
       POSTGRES_USER: curio
       POSTGRES_PASSWORD: curio
     volumes:
-      - curio_postgres:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U curio -d curio"]
       interval: 5s
       timeout: 5s
       retries: 20
-    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
+    container_name: curio-redis
     command:
       - redis-server
       - --appendonly
       - "yes"
       - --maxmemory
-      - 192mb
+      - "192mb"
       - --maxmemory-policy
-      - volatile-lru
+      - allkeys-lru
+    restart: unless-stopped
     volumes:
-      - curio_redis:/data
+      - ./data/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 20
-    restart: unless-stopped
 
   curio:
-    image: mon3trd/curio:latest
+    image: mon3trd/curio:1.0.1
+    container_name: curio
     user: "0:0"
+    restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
-      SERVER_ADDR: ":8080"
-      DATABASE_URL: "postgres://curio:curio@db:5432/curio?sslmode=disable"
-      REDIS_ADDR: "redis:6379"
-      CURIO_DATA_ROOT: "/data/Curio"
-      FRONTEND_ORIGIN: "*"
-      FRONTEND_DIR: "/app/public"
-      TMDB_API_KEY: ""
-      NETWORK_PROXY: ""
       CURIO_PLAY_SECRET: "change-me"
     ports:
       - "8080:8080"
-      - "8097:8097"
+      - "18097:8097"
     volumes:
-      - ./data:/data/Curio
+      - ./data/Curio:/data/Curio
       - ./config:/config
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -61,8 +57,3 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
-
-volumes:
-  curio_postgres:
-  curio_redis:

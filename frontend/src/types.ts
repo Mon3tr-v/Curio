@@ -60,6 +60,8 @@ export type P115Settings = {
   delete_missing_strm: boolean;
   stale_before_delete: boolean;
   refresh_emby_after_sync: boolean;
+  sync_cron_enabled: boolean;
+  sync_interval_minutes: number;
   emby_upstream_url: string;
   emby_public_url: string;
   emby_proxy_port: number;
@@ -101,6 +103,7 @@ export type P115AuthResult = {
 
 export type STRMSyncResult = {
   tree_version: string;
+  mode?: string;
   exported: number;
   generated: number;
   restored: number;
@@ -108,6 +111,25 @@ export type STRMSyncResult = {
   deleted: number;
   skipped: number;
   failed: number;
+};
+
+export type P115SyncRun = {
+  id: string;
+  trigger: string;
+  status: string;
+  mode: string;
+  tree_version: string;
+  exported: number;
+  generated: number;
+  restored: number;
+  updated: number;
+  deleted: number;
+  skipped: number;
+  failed: number;
+  error_message: string;
+  started_at: string;
+  ended_at?: string;
+  duration_ms: number;
 };
 
 export type ClassificationConfig = {
@@ -193,6 +215,13 @@ export type RearchivePayload = {
   episode_offset?: number;
 };
 
+export type RearchiveBatchResult = {
+  items: MediaFile[];
+  count: number;
+  failed: number;
+  errors: { file_id: string; message: string }[];
+};
+
 export type Collection = {
   tmdb_id: number;
   name: string;
@@ -204,6 +233,13 @@ export type Collection = {
   poster_path: string;
   backdrop_path: string;
   parts?: CollectionMovie[];
+};
+
+export type CollectionPage = {
+  items: Collection[];
+  total: number;
+  limit: number;
+  offset: number;
 };
 
 export type CollectionMovie = {
@@ -237,6 +273,13 @@ export type TVShow = {
   poster_path: string;
   backdrop_path: string;
   seasons?: TVSeason[];
+};
+
+export type TVShowPage = {
+  items: TVShow[];
+  total: number;
+  limit: number;
+  offset: number;
 };
 
 export type TVSeason = {
@@ -274,4 +317,13 @@ export type Health = {
   redis: string;
   queues: Record<string, number>;
   active_task?: Batch | null;
+};
+
+export type AuthStatus = {
+  enabled: boolean;
+};
+
+export type AuthLoginResult = {
+  status: string;
+  enabled: boolean;
 };

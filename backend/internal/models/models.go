@@ -46,6 +46,18 @@ const (
 )
 
 const (
+	P115SyncTriggerManualExport  = "manual_export"
+	P115SyncTriggerManualSync    = "manual_sync"
+	P115SyncTriggerManualCleanup = "manual_cleanup"
+	P115SyncTriggerCron          = "cron"
+
+	P115SyncStatusRunning = "running"
+	P115SyncStatusSuccess = "success"
+	P115SyncStatusPartial = "partial"
+	P115SyncStatusFailed  = "failed"
+)
+
+const (
 	TemplateMovie                = "movie"
 	TemplateTVEpisode            = "tv_episode"
 	TemplateCollectionMovie      = "collection_movie"
@@ -142,6 +154,8 @@ type P115Settings struct {
 	StaleBeforeDelete    bool      `json:"stale_before_delete"`
 	KeepDeletedDays      int       `json:"-"`
 	RefreshEmbyAfterSync bool      `json:"refresh_emby_after_sync"`
+	SyncCronEnabled      bool      `json:"sync_cron_enabled"`
+	SyncIntervalMinutes  int       `json:"sync_interval_minutes"`
 	EmbyUpstreamURL      string    `json:"emby_upstream_url"`
 	EmbyPublicURL        string    `json:"emby_public_url"`
 	EmbyProxyPort        int       `json:"emby_proxy_port"`
@@ -208,6 +222,7 @@ type STRMLink struct {
 
 type STRMSyncResult struct {
 	TreeVersion string `json:"tree_version"`
+	Mode        string `json:"mode"`
 	Exported    int    `json:"exported"`
 	Generated   int    `json:"generated"`
 	Restored    int    `json:"restored"`
@@ -217,15 +232,66 @@ type STRMSyncResult struct {
 	Failed      int    `json:"failed"`
 }
 
+type P115SyncRun struct {
+	ID           string     `json:"id"`
+	Trigger      string     `json:"trigger"`
+	Status       string     `json:"status"`
+	Mode         string     `json:"mode"`
+	TreeVersion  string     `json:"tree_version"`
+	Exported     int        `json:"exported"`
+	Generated    int        `json:"generated"`
+	Restored     int        `json:"restored"`
+	Updated      int        `json:"updated"`
+	Deleted      int        `json:"deleted"`
+	Skipped      int        `json:"skipped"`
+	Failed       int        `json:"failed"`
+	ErrorMessage string     `json:"error_message"`
+	StartedAt    time.Time  `json:"started_at"`
+	EndedAt      *time.Time `json:"ended_at,omitempty"`
+	DurationMS   int64      `json:"duration_ms"`
+}
+
 type P115TreeSnapshotItem struct {
 	LibraryCID     string `json:"library_cid"`
 	TreeVersion    string `json:"tree_version"`
 	RelativePath   string `json:"relative_path"`
 	Name           string `json:"name"`
+	RemoteFileID   string `json:"remote_file_id"`
+	ParentFileID   string `json:"parent_file_id"`
+	PickCode       string `json:"pickcode"`
+	SHA1           string `json:"sha1"`
+	Size           int64  `json:"size"`
 	Extension      string `json:"extension"`
 	Depth          int    `json:"depth"`
+	IsDirectory    bool   `json:"is_directory"`
 	IsMedia        bool   `json:"is_media"`
 	SourceTreeHash string `json:"source_tree_hash"`
+}
+
+type P115Node struct {
+	LibraryCID     string    `json:"library_cid"`
+	TreeVersion    string    `json:"tree_version"`
+	RemoteFileID   string    `json:"remote_file_id"`
+	ParentFileID   string    `json:"parent_file_id"`
+	RelativePath   string    `json:"relative_path"`
+	Name           string    `json:"name"`
+	PickCode       string    `json:"pickcode"`
+	SHA1           string    `json:"sha1"`
+	Size           int64     `json:"size"`
+	IsDirectory    bool      `json:"is_directory"`
+	IsMedia        bool      `json:"is_media"`
+	IsAlive        bool      `json:"is_alive"`
+	SourceTreeHash string    `json:"source_tree_hash"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+type P115EventCursor struct {
+	LibraryCID     string    `json:"library_cid"`
+	LastEventID    int64     `json:"last_event_id"`
+	LastEventTime  int64     `json:"last_event_time"`
+	LastSyncStatus string    `json:"last_sync_status"`
+	LastSyncError  string    `json:"last_sync_error"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type EmbySTRMItem struct {
@@ -395,6 +461,13 @@ type TVShowStatus struct {
 	Seasons                []TVSeasonStatus `json:"seasons,omitempty"`
 }
 
+type TVShowPage struct {
+	Items  []TVShowStatus `json:"items"`
+	Total  int            `json:"total"`
+	Limit  int            `json:"limit"`
+	Offset int            `json:"offset"`
+}
+
 type TVSeasonStatus struct {
 	Season                 int                 `json:"season"`
 	EpisodeCount           int                 `json:"episode_count"`
@@ -417,6 +490,13 @@ type CollectionMetadata struct {
 	PosterPath      string                    `json:"poster_path"`
 	BackdropPath    string                    `json:"backdrop_path"`
 	Parts           []CollectionMovieMetadata `json:"parts,omitempty"`
+}
+
+type CollectionPage struct {
+	Items  []CollectionMetadata `json:"items"`
+	Total  int                  `json:"total"`
+	Limit  int                  `json:"limit"`
+	Offset int                  `json:"offset"`
 }
 
 type CollectionMovieMetadata struct {

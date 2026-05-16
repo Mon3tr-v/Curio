@@ -2,14 +2,17 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -30,11 +33,12 @@ import (
 )
 
 type API struct {
-	store   *repository.Store
-	worker  *worker.Service
-	scraper *scraper.Client
-	redis   *redis.Client
-	p115    *p115.Service
+	store      *repository.Store
+	worker     *worker.Service
+	scraper    *scraper.Client
+	redis      *redis.Client
+	p115       *p115.Service
+	adminToken string
 }
 
 type rearchivePayload struct {
@@ -59,19 +63,23 @@ func (p rearchivePayload) options() worker.RearchiveOptions {
 
 func New(store *repository.Store, workerService *worker.Service, scraperClient *scraper.Client, redisClient *redis.Client, allowedOrigin, frontendDir string) http.Handler {
 	p115Service := p115.NewService(store)
-	return NewWithP115(store, workerService, scraperClient, redisClient, p115Service, allowedOrigin, frontendDir)
+	return NewWithP115(store, workerService, scraperClient, redisClient, p115Service, allowedOrigin, frontendDir, "")
 }
 
-func NewWithP115(store *repository.Store, workerService *worker.Service, scraperClient *scraper.Client, redisClient *redis.Client, p115Service *p115.Service, allowedOrigin, frontendDir string) http.Handler {
-	api := &API{store: store, worker: workerService, scraper: scraperClient, redis: redisClient, p115: p115Service}
+func NewWithP115(store *repository.Store, workerService *worker.Service, scraperClient *scraper.Client, redisClient *redis.Client, p115Service *p115.Service, allowedOrigin, frontendDir, adminToken string) http.Handler {
+	api := &API{store: store, worker: workerService, scraper: scraperClient, redis: redisClient, p115: p115Service, adminToken: strings.TrimSpace(adminToken)}
 	router := chi.NewRouter()
+	router.Use(recoverJSON)
 	router.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{allowedOrigin},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Curio-Token"},
 		AllowCredentials: false,
 		MaxAge:           300,
 	}))
+	router.Use(api.authMiddleware)
+	router.Get("/api/auth/status", api.authStatus)
+	router.Post("/api/auth/login", api.authLogin)
 	router.Get("/api/health", api.health)
 	router.Get("/api/events", api.events)
 	router.Post("/api/scan/start", api.startScan)
@@ -100,6 +108,7 @@ func NewWithP115(store *repository.Store, workerService *worker.Service, scraper
 	router.Post("/api/p115/export-tree", api.exportP115Tree)
 	router.Post("/api/p115/strm/sync", api.syncP115STRM)
 	router.Post("/api/p115/strm/cleanup", api.cleanupP115STRM)
+	router.Get("/api/p115/sync-runs", api.p115SyncRuns)
 	router.Get("/api/settings/classification", api.classification)
 	router.Put("/api/settings/classification", api.saveClassification)
 	router.Get("/api/settings/templates", api.templates)
@@ -127,6 +136,53 @@ func NewWithP115(store *repository.Store, workerService *worker.Service, scraper
 	return router
 }
 
+func (a *API) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a.adminToken == "" || !strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/api/auth/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		token := strings.TrimSpace(r.Header.Get("X-Curio-Token"))
+		if token == "" {
+			auth := strings.TrimSpace(r.Header.Get("Authorization"))
+			if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+				token = strings.TrimSpace(auth[7:])
+			}
+		}
+		if token == "" && r.URL.Path == "/api/events" {
+			token = strings.TrimSpace(r.URL.Query().Get("token"))
+		}
+		if subtle.ConstantTimeCompare([]byte(token), []byte(a.adminToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, "需要 Curio 管理令牌")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *API) authStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": a.adminToken != ""})
+}
+
+func (a *API) authLogin(w http.ResponseWriter, r *http.Request) {
+	if a.adminToken == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": false})
+		return
+	}
+	var payload struct {
+		Token string `json:"token"`
+	}
+	if err := decodeJSON(w, r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(payload.Token)), []byte(a.adminToken)) != 1 {
+		writeError(w, http.StatusUnauthorized, "管理令牌无效")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "enabled": true})
+}
+
 func (a *API) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -136,7 +192,7 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "当前连接不支持实时事件")
 		return
 	}
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -198,6 +254,10 @@ func (a *API) startCloudDriveScan(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, worker.ErrTaskAlreadyRunning) {
 			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, worker.ErrCloudDriveNotReady) {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -308,7 +368,7 @@ func (a *API) systemSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, settings)
+	writeJSON(w, http.StatusOK, redactSystemSettings(settings))
 }
 
 func (a *API) saveSystemSettings(w http.ResponseWriter, r *http.Request) {
@@ -326,6 +386,7 @@ func (a *API) saveSystemSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	mergeHiddenSystemSettings(&settings, current)
 	settings.ClassificationYAML = current.ClassificationYAML
 	if settings.NetworkProxy != "" {
 		parsed, err := url.Parse(settings.NetworkProxy)
@@ -347,7 +408,7 @@ func (a *API) saveSystemSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, saved)
+	writeJSON(w, http.StatusOK, redactSystemSettings(saved))
 }
 
 func (a *API) cloudDriveSettings(w http.ResponseWriter, r *http.Request) {
@@ -358,7 +419,7 @@ func (a *API) cloudDriveSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, settings)
+	writeJSON(w, http.StatusOK, redactCloudDriveSettings(settings))
 }
 
 func (a *API) saveCloudDriveSettings(w http.ResponseWriter, r *http.Request) {
@@ -368,6 +429,9 @@ func (a *API) saveCloudDriveSettings(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(w, r, &settings); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if existing, err := a.store.CloudDriveSettings(ctx); err == nil {
+		mergeHiddenCloudDriveSettings(&settings, existing)
 	}
 	normalized, err := validateCloudDriveSettings(settings)
 	if err != nil {
@@ -379,7 +443,7 @@ func (a *API) saveCloudDriveSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, saved)
+	writeJSON(w, http.StatusOK, redactCloudDriveSettings(saved))
 }
 
 func (a *API) p115Settings(w http.ResponseWriter, r *http.Request) {
@@ -392,7 +456,7 @@ func (a *API) p115Settings(w http.ResponseWriter, r *http.Request) {
 	}
 	settings = normalizeEmbyPortSettings(settings)
 	settings.CookieLoginApp = p115.NormalizeCookieLoginApp(settings.CookieLoginApp)
-	writeJSON(w, http.StatusOK, settings)
+	writeJSON(w, http.StatusOK, redactP115Settings(settings))
 }
 
 func (a *API) saveP115Settings(w http.ResponseWriter, r *http.Request) {
@@ -416,7 +480,7 @@ func (a *API) saveP115Settings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, saved)
+	writeJSON(w, http.StatusOK, redactP115Settings(saved))
 }
 
 func (a *API) startP115QRCode(w http.ResponseWriter, r *http.Request) {
@@ -561,6 +625,18 @@ func (a *API) cleanupP115STRM(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (a *API) p115SyncRuns(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := contextWithTimeout(r)
+	defer cancel()
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	runs, err := a.p115.SyncRuns(ctx, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, runs)
+}
+
 func (a *API) play115(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
@@ -687,6 +763,19 @@ func (a *API) failed(w http.ResponseWriter, r *http.Request) {
 func (a *API) mediaByStatus(w http.ResponseWriter, r *http.Request, status string) {
 	ctx, cancel := contextWithTimeout(r)
 	defer cancel()
+	limit, offset := paginationFromRequest(r)
+	if status == "" {
+		status = strings.TrimSpace(r.URL.Query().Get("status"))
+	}
+	files, err := a.store.ListMediaFiles(ctx, status, strings.TrimSpace(r.URL.Query().Get("q")), limit, offset)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, files)
+}
+
+func paginationFromRequest(r *http.Request) (int, int) {
 	limit := 50
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
 		if value, err := strconv.Atoi(raw); err == nil && value > 0 && value <= 200 {
@@ -699,12 +788,7 @@ func (a *API) mediaByStatus(w http.ResponseWriter, r *http.Request, status strin
 			offset = value
 		}
 	}
-	files, err := a.store.ListMediaFiles(ctx, status, strings.TrimSpace(r.URL.Query().Get("q")), limit, offset)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, files)
+	return limit, offset
 }
 
 func (a *API) bulkDeleteMediaFiles(w http.ResponseWriter, r *http.Request) {
@@ -788,12 +872,12 @@ func (a *API) bulkRearchiveMediaFiles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "媒体文件 ID 不能为空")
 		return
 	}
-	files, err := a.worker.RearchiveMediaBatch(ctx, ids, payload.options())
+	files, failures, err := a.worker.RearchiveMediaBatch(ctx, ids, payload.options())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": files, "count": len(files)})
+	writeJSON(w, http.StatusOK, map[string]any{"items": files, "count": len(files), "failed": len(failures), "errors": failures})
 }
 
 func (a *API) testCloudDrive(w http.ResponseWriter, r *http.Request) {
@@ -835,7 +919,8 @@ func (a *API) cloudDriveFiles(w http.ResponseWriter, r *http.Request) {
 func (a *API) collections(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r)
 	defer cancel()
-	collections, err := a.store.Collections(ctx)
+	limit, offset := paginationFromRequest(r)
+	collections, err := a.store.Collections(ctx, strings.TrimSpace(r.URL.Query().Get("q")), limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -846,7 +931,8 @@ func (a *API) collections(w http.ResponseWriter, r *http.Request) {
 func (a *API) tvShows(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r)
 	defer cancel()
-	shows, err := a.store.TVShows(ctx)
+	limit, offset := paginationFromRequest(r)
+	shows, err := a.store.TVShows(ctx, strings.TrimSpace(r.URL.Query().Get("q")), limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -985,9 +1071,73 @@ func validateCloudDriveSettings(settings models.CloudDriveSettings) (models.Clou
 	return settings, nil
 }
 
+const hiddenSecretValue = "********"
+
+func isHiddenSecret(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && strings.Trim(value, "*") == ""
+}
+
+func redactedSecret(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return hiddenSecretValue
+}
+
+func redactSystemSettings(settings models.SystemSettings) models.SystemSettings {
+	settings.TMDBAPIKey = redactedSecret(settings.TMDBAPIKey)
+	settings.CloudDrivePassword = redactedSecret(settings.CloudDrivePassword)
+	settings.CloudDriveToken = redactedSecret(settings.CloudDriveToken)
+	return settings
+}
+
+func mergeHiddenSystemSettings(next *models.SystemSettings, existing models.SystemSettings) {
+	if isHiddenSecret(next.TMDBAPIKey) {
+		next.TMDBAPIKey = existing.TMDBAPIKey
+	}
+	if isHiddenSecret(next.CloudDrivePassword) {
+		next.CloudDrivePassword = existing.CloudDrivePassword
+	}
+	if isHiddenSecret(next.CloudDriveToken) {
+		next.CloudDriveToken = existing.CloudDriveToken
+	}
+}
+
+func redactCloudDriveSettings(settings models.CloudDriveSettings) models.CloudDriveSettings {
+	settings.Password = redactedSecret(settings.Password)
+	settings.Token = redactedSecret(settings.Token)
+	return settings
+}
+
+func mergeHiddenCloudDriveSettings(next *models.CloudDriveSettings, existing models.CloudDriveSettings) {
+	if isHiddenSecret(next.Password) {
+		next.Password = existing.Password
+	}
+	if isHiddenSecret(next.Token) {
+		next.Token = existing.Token
+	}
+}
+
+func redactP115Settings(settings models.P115Settings) models.P115Settings {
+	settings.AppSecret = redactedSecret(settings.AppSecret)
+	settings.Cookies = redactedSecret(settings.Cookies)
+	settings.EmbyAPIKey = redactedSecret(settings.EmbyAPIKey)
+	return settings
+}
+
 func mergeHiddenP115Settings(next *models.P115Settings, existing models.P115Settings) {
 	if next.AuthMode == "" {
 		next.AuthMode = existing.AuthMode
+	}
+	if isHiddenSecret(next.AppSecret) {
+		next.AppSecret = existing.AppSecret
+	}
+	if isHiddenSecret(next.Cookies) {
+		next.Cookies = existing.Cookies
+	}
+	if isHiddenSecret(next.EmbyAPIKey) {
+		next.EmbyAPIKey = existing.EmbyAPIKey
 	}
 	if next.AccessToken == "" {
 		next.AccessToken = existing.AccessToken
@@ -1062,6 +1212,12 @@ func validateP115Settings(settings models.P115Settings) (models.P115Settings, er
 	}
 	if settings.KeepDeletedDays <= 0 {
 		settings.KeepDeletedDays = 7
+	}
+	if settings.SyncIntervalMinutes <= 0 {
+		settings.SyncIntervalMinutes = 60
+	}
+	if settings.SyncIntervalMinutes < 5 || settings.SyncIntervalMinutes > 10080 {
+		return models.P115Settings{}, errors.New("115 定时同步间隔必须在 5 到 10080 分钟之间")
 	}
 	settings.EmbyUpstreamURL = strings.TrimRight(strings.TrimSpace(settings.EmbyUpstreamURL), "/")
 	if settings.EmbyUpstreamURL != "" {
@@ -1188,6 +1344,18 @@ func isInside(parent, child string) bool {
 
 func contextWithTimeout(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(r.Context(), 10*time.Second)
+}
+
+func recoverJSON(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Printf("api panic: %v\n%s", recovered, debug.Stack())
+				writeError(w, http.StatusInternalServerError, "服务处理请求时异常退出，请查看后端日志")
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func requestBaseURL(r *http.Request) string {

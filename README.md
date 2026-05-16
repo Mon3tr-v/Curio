@@ -1,42 +1,42 @@
 # Curio
 
-Curio 是一个媒体识别、重命名、归档和 STRM 播放辅助工具。它可以处理本地文件，也可以通过 CloudDrive2 处理云端文件；可以接入 TMDB 获取电影、剧集、合集信息；可以根据 YAML 分类策略和命名模板生成整理路径；也可以通过 115 生成 STRM，并提供 302 播放入口给 Emby 或播放器使用。
+Curio 是一个面向家庭媒体库的整理与 STRM 播放辅助工具。它可以整理本地文件，也可以通过 CloudDrive2 处理云端文件；可以接入 TMDB 识别电影、剧集和合集；可以按分类 YAML 和命名模板生成归档路径；也可以接入 115 生成 STRM，并提供 302 播放入口给 Emby 或播放器使用。
 
-## 1. 基础架构
+## 功能概览
 
-Curio 由以下服务组成：
+- 本地媒体整理：扫描、识别、分类、重命名、归档、字幕同步、空目录清理。
+- CloudDrive2 整理：通过 CloudDrive2 处理云端文件，支持云端移动和字幕同步。
+- TMDB 识别：优先 `zh-CN`，其次 `zh-SG`，最后回退英文。
+- 剧集识别：支持季、集、季偏移、集偏移，统计缺失季和缺失集。
+- 合集识别：统计已有电影、缺失电影和未上映电影，未上映电影不计入缺失。
+- 分类策略：通过 YAML 配置电影和剧集的二级分类。
+- 命名模板：支持电影、剧集、完整合集、缺失合集模板。
+- 真实媒体参数：按需通过 `ffprobe` 获取 `resolution`、`video_codec`、`audio_codec`、`audio_channels`、`hdr_format`。
+- 字幕处理：识别简体和繁体字幕，并生成 `.chs`、`.cht` 后缀。
+- 115 STRM：支持 CID 媒体库、目录树同步、操作记录增量同步、定时同步、STRM 清理。
+- 115 302 播放：播放时使用播放器 User-Agent 获取直链，媒体流量不经过 Curio。
+- Emby 反代：提供独立端口用于拦截 Emby 播放请求并返回 302。
+- 任务控制：支持开始、停止、单任务锁、任务恢复、分页搜索、批量删除记录、批量重新归档。
+- 前端体验：Google 风格布局，设置页顶部 Tab 分组，按钮和图标统一视觉。
 
-- `backend`：Go 后端，提供 API、任务调度、识别整理、115 STRM 和 Emby 反代。
-- `frontend`：React 前端，已打包进 backend 镜像，由 backend 直接托管。
-- `db`：PostgreSQL，保存设置、任务、媒体文件、TMDB 元数据、剧集和合集状态。
-- `redis`：保存任务队列和扫描锁，避免重复任务。
-- `CloudDrive2`：可选，用于处理云端文件。
-- `115`：可选，用于 STRM 生成和 302 播放。
-- `Emby`：可选，用于通过 Curio 反代实现 115 STRM 302 播放。
-
-默认访问地址：
-
-- Curio Web：`http://localhost:8080`
-- Emby 反代入口：`http://localhost:8097`
-
-## 2. 快速启动
+## 快速部署
 
 1. 准备 Docker 和 Docker Compose。
-2. 获取项目：
+
+2. 下载项目：
 
 ```bash
 git clone https://github.com/Mon3tr-v/Curio.git
 cd Curio
 ```
 
-3. 按需修改 `docker-compose.yml`：
+3. 修改 `docker-compose.yml` 中的 `CURIO_PLAY_SECRET`：
 
-- 默认镜像：`mon3trd/curio:latest`
-- Web 端口：`8080`
-- Emby 反代端口：`8097`
-- 数据目录：`./data`
-- 配置目录：`./config`
-- 首次部署建议把 `CURIO_PLAY_SECRET` 改成随机长字符串。
+```yaml
+CURIO_PLAY_SECRET: "change-me"
+```
+
+建议改成一段足够长的随机字符串。它用于签名 115 播放链接。
 
 4. 启动：
 
@@ -44,231 +44,234 @@ cd Curio
 docker compose up -d
 ```
 
-5. 打开：
+5. 打开 Curio：
 
 ```text
 http://localhost:8080
 ```
 
-6. 首次进入后先配置 `设置` 页面。
+默认端口：
 
-## 3. 首次配置
+- Web：`8080`
+- Emby 反代播放入口：`18097` 映射到容器内 `8097`
 
-### 3.1 本地目录
+## Docker Compose
 
-位置：`设置 -> 基础 -> 本地目录`
+仓库内的 `docker-compose.yml` 已尽量保持简单，适合 Linux、Windows Docker Desktop、极空间、绿联、飞牛 NAS 等环境。
 
-- `入库目录`：Curio 扫描的本地源目录。
-- `整理目录`：识别成功后移动到的目标目录。
-- `失败目录`：识别或移动失败后归档目录。
-- `缺失合集目录`：合集未完整时的临时归档目录。
+```yaml
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: curio-db
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      POSTGRES_DB: curio
+      POSTGRES_USER: curio
+      POSTGRES_PASSWORD: curio
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U curio -d curio"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: curio-redis
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - "192mb"
+      - --maxmemory-policy
+      - allkeys-lru
+    restart: unless-stopped
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  curio:
+    image: mon3trd/curio:1.0.1
+    container_name: curio
+    user: "0:0"
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      CURIO_PLAY_SECRET: "change-me"
+    ports:
+      - "8080:8080"
+      - "18097:8097"
+    volumes:
+      - ./data/Curio:/data/Curio
+      - ./config:/config
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+```
 
 注意：
 
-- 四个目录不能相同。
-- 输出目录不能位于入库目录内部。
+- 不需要在 compose 里配置 CloudDrive2 地址，进入前端设置页填写即可。
+- 不需要在 compose 里配置 TMDB、115、Emby，大部分运行配置都在前端设置页维护。
+- 如果你已经用旧 compose 跑过数据库，迁移到 bind mount 前先备份 PostgreSQL 数据。
+- 如果 Curio 需要访问宿主机代理，通常可以在前端设置页填写 `http://host.docker.internal:7890`。Linux 或部分 NAS 不支持时，改填宿主机实际 IP。
+
+## 首次配置
+
+### 基础设置
+
+位置：`设置 -> 基础`
+
+- 入库目录：本地扫描源目录。
+- 整理目录：识别成功后的归档目录。
+- 失败目录：识别或移动失败后的归档目录。
+- 缺失合集目录：合集未完整时的归档目录。
+- TMDB API Key：用于识别电影、剧集和合集。
+- 网络代理：例如 `http://192.168.31.251:7890`。
+
+目录要求：
+
+- 入库、整理、失败、缺失合集目录不要互相嵌套。
 - Curio 会自动创建目录并检查读写权限。
+- 非媒体文件不会进入状态机。
 
-### 3.2 TMDB 与网络
+### CloudDrive2
 
-位置：`设置 -> 基础 -> TMDB 与网络`
+位置：`设置 -> 云端`
 
-- `TMDB API Key`：用于识别电影、剧集和合集。
-- `网络代理`：可填写 `http://host:port` 或 `https://host:port`。
+- 服务地址：CloudDrive2 HTTP/gRPC 地址。
+- 用户名、密码、Token：按 CloudDrive2 实际登录方式填写。
+- 扫描根目录：云端入库目录。
+- 整理目录、失败目录、缺失合集目录：云端目标目录。
 
-识别标题优先级：
+点击 `测试连接` 检查连通性，点击 `整理云端` 启动云端整理任务。
 
-1. `zh-CN`
-2. `zh-SG`
-3. 英文
-
-如果简体中文标题缺失或 TMDB 返回英文，会继续尝试其他语言，最终回退英文。
-
-### 3.3 CloudDrive2
-
-位置：`设置 -> 云端 -> CloudDrive2`
-
-- `服务地址`：CloudDrive2 HTTP/gRPC 地址。
-- `用户名 / 密码 / Token`：按 CloudDrive2 配置填写。
-- `扫描根目录`：云端扫描入口。
-- `整理目录 / 失败目录 / 缺失合集目录`：云端整理目标目录。
-
-点击 `测试` 检查连接，点击 `整理云端` 启动云端整理任务。
-
-### 3.4 115
+### 115
 
 位置：`设置 -> 115`
 
-核心字段：
+- Cookies：用于 115 Web 接口，优先用于目录树导出和部分播放兜底。
+- Open Token：可以从 OpenList 导入，用于 Open API 和直链获取兜底。
+- 媒体库 CID：只填写一个 115 目录 CID，Curio 只同步这个目录下的媒体。
+- STRM 输出目录：生成 `.strm` 文件的位置。
+- Curio 外部地址：播放器访问 Curio 的地址，例如 `http://192.168.31.251:8080`。
+- 同步间隔：开启定时增量同步时使用。
 
-- `Cookies`：用于 115 Web API，优先用于目录树导出。
-- `扫码设备`：用于扫码获取 Cookies，默认 `微信小程序`。
-- `媒体库 CID`：只填写一个 115 目录 CID，Curio 只会导出或扫描这个 CID 下的目录。
-- `STRM 输出目录`：生成 `.strm` 文件的位置。
-- `Curio 外部地址`：播放器访问 Curio 的地址，例如 `http://192.168.10.10:8080`。
+推荐使用 Cookies 方式同步目录树，API 请求更少，也更适合大目录。Open Token 可以保留为直链和接口兜底。
 
-获取 Cookies：
-
-1. 点击 `获取 Cookies`。
-2. 用 115 App 扫码。
-3. 手机确认后点击 `保存 Cookies`。
-
-Open Token：
-
-- `OpenList Access Token / Refresh Token` 可以导入。
-- `OAuth 登录` 保留给你以后使用自己的 App ID / App Secret。
-- Open Token 可用于 Open API 和 302 直链，但当前目录树导出优先使用 Cookies。
-
-115 STRM 同步逻辑：
-
-- 有 Cookies：优先调用 115 Web 的目录树导出接口，下载目录树文本后解析。
-- 只有 Open Token：递归分页扫描 CID 下的完整目录。
-- 每次同步都会生成当前快照，再和数据库旧记录做差异对比。
-- 源目录删除或移动后，Curio 会标记或删除对应 STRM。
-
-### 3.5 Emby 反代
+### Emby
 
 位置：`设置 -> Emby`
 
-- `Emby 原始地址`：真实 Emby 地址，例如 `http://192.168.10.83:8096`。
-- `Emby 对外地址`：给播放器访问的 Curio 反代地址，例如 `http://192.168.10.83:8097`。
-- `反代端口`：默认 `8097`。
-- `API Key`：用于同步后刷新 Emby 媒体库。
+- Emby 原始地址：真实 Emby 地址，例如 `http://192.168.31.251:8096`。
+- Emby 对外地址：播放器访问的 Curio 反代地址，例如 `http://192.168.31.251:18097`。
+- 反代端口：容器内默认 `8097`，compose 默认映射为宿主机 `18097`。
+- API Key：可用于同步后刷新 Emby 媒体库。
 
-Emby 使用方式：
+Emby 挂载建议：
 
-1. Emby 媒体库指向 Curio 生成的 STRM 目录。
-2. 播放器访问 Emby 反代端口。
-3. Curio 拦截播放请求。
-4. Curio 根据 STRM 链接向 115 获取直链。
-5. 返回 `302` 给播放器。
+```yaml
+services:
+  emby:
+    volumes:
+      - ./data/Curio:/data/Curio
+```
 
-媒体流量不经过 Curio 本机。
+如果 Curio 的 STRM 输出目录是 `/data/Curio/strm`，Emby 媒体库也应指向同一个容器路径 `/data/Curio/strm`，这样 STRM 内的相对路径和媒体库扫描更稳定。
 
-## 4. 页面说明
+## 整理层级
 
-### 4.1 总览
-
-显示系统状态、任务状态、最近批次和最近活动。
-
-可查看：
-
-- 数据库状态
-- Redis 状态
-- 当前任务
-- 成功、失败、缺失合集数量
-
-### 4.2 扫描
-
-用于启动本地整理任务。
-
-按钮：
-
-- `开始整理`：扫描本地入库目录。
-- `整理云端`：扫描 CloudDrive2 配置的云端根目录。
-- `停止`：停止当前活动任务。
-
-任务同一时间只能运行一个。刷新页面后仍会保留当前页面和任务状态。
-
-### 4.3 处理 / 完成 / 失败
-
-三类页面都支持：
-
-- 搜索
-- 分页
-- 单选
-- 全选
-- 批量删除数据库记录
-- 批量重新归档
-- 点击行查看详情
-
-删除只删除数据库记录，不删除真实源文件。
-
-重新归档：
-
-- 电影：可输入 TMDB ID，也可以留空按当前文件名重新识别。
-- 剧集：可输入 TMDB ID、季、集、季偏移、集偏移。
-- 失败记录和识别错误记录都可以使用重新归档。
-
-### 4.4 剧集
-
-剧集页面按 TMDB 剧集聚合。
-
-详情弹窗显示：
-
-- 季列表
-- 已有集数
-- 缺失集数
-- 未播出集数
-- 每集标题、播出日期、本地文件状态
-
-未播出的集不会计入缺失。
-
-### 4.5 合集
-
-合集页面按 TMDB Collection 聚合。
-
-详情弹窗显示：
-
-- 合集内所有电影
-- 已拥有电影
-- 缺失电影
-- 未上映电影
-
-未上映电影会单独统计，不计入缺失。
-
-### 4.6 分类
-
-位置：`分类`
-
-使用 YAML 配置电影和剧集分类策略。分类名也是二级目录名。
-
-整理层级固定为：
+Curio 固定使用一级媒体类型目录，再使用分类策略生成二级目录。
 
 ```text
-movies / 二级分类 / 片名 / 文件
+movies / 二级分类 / 电影名 / 文件
 tv / 二级分类 / 剧名 / Season xx / 文件
-collections / 二级分类 / 合集名 / 片名 / 文件
+collections / 二级分类 / 合集名 / 电影名 / 文件
 ```
 
 示例：
+
+```text
+movies/欧美电影/Inception (2010)/Inception (2010) - 2160p HEVC TrueHD 7.1.mkv
+tv/日本剧集/Dark (2017)/Season 01/Dark - S01E01 - 1080p AVC EAC3 5.1.mkv
+collections/欧美电影/John Wick Collection/John Wick (2014)/John Wick (2014) - 2160p HEVC.mkv
+```
+
+## 分类 YAML
+
+位置：`分类`
+
+配置为空或不配置时，不启用对应媒体类型的分类。分类名也是二级目录名，按配置顺序匹配，命中后停止。
 
 ```yaml
 movie:
   纪录片:
     genre_ids: "99,-10402"
+  演唱会:
+    genre_ids: "10402"
+  动画电影:
+    genre_ids: "16"
+  华语电影:
+    original_language: "zh,cn,bo,za"
+  日韩电影:
+    original_language: "ja,ko,th"
   欧美电影:
 
 tv:
+  国漫:
+    genre_ids: "16"
+    origin_country: "CN,TW,HK"
+  日漫:
+    genre_ids: "16"
+    origin_country: "JP"
+  纪录片:
+    genre_ids: "99"
   国产剧集:
     origin_country: "CN,SG"
+  日本剧集:
+    origin_country: "JP"
   欧美剧集:
     origin_country: "US,FR,GB,DE,ES,IT,NL,PT,RU,UK,CO"
   未分类:
 ```
 
-规则说明：
+支持字段：
 
-- `genre_ids`：类型 ID。
+- `genre_ids`：TMDB 类型 ID。
 - `original_language`：原始语言。
 - `origin_country`：剧集国家或地区。
 - `production_countries`：电影制片国家或地区。
-- 值用逗号分隔。
-- 负号表示排除。
+- `keywords`：关键词，配置后需要同时命中。
+
+匹配规则：
+
+- 多个条件需要同时满足。
+- 逗号表示多个可选值。
+- 负号表示排除，例如 `99,-10402`。
 - 空分类表示兜底分类。
 
-### 4.7 命名
+## 命名模板
 
 位置：`命名`
 
-可配置四类模板：
+支持四类模板：
 
-- 电影
-- 剧集
-- 完整合集
-- 缺失合集
-
-可点击字段说明按钮查看全部字段，并点击复制。
+- 电影模板
+- 剧集模板
+- 完整合集模板
+- 缺失合集模板
 
 常用字段：
 
@@ -294,7 +297,7 @@ tv:
 {collection_id}
 ```
 
-技术字段来源：
+真实媒体字段：
 
 - `{resolution}`
 - `{video_codec}`
@@ -302,221 +305,158 @@ tv:
 - `{audio_channels}`
 - `{hdr_format}`
 
-这些字段优先通过 `ffprobe` 获取真实媒体信息，而不是从文件名猜测。模板没有使用技术字段时，Curio 会跳过不必要的 ffprobe，减少耗时。
+这些字段优先来自 `ffprobe`，不再依赖文件名猜测。模板没有使用技术字段时，Curio 会跳过不必要的 `ffprobe`，减少耗时。
 
 编码规范化：
 
-- `H265`、`x265`、`h.265` 会归一为 `HEVC`。
-- `H264`、`x264`、`h.264` 会归一为 `AVC`。
-- 其他编码也会尽量输出标准名称。
+- `H265`、`H.265`、`x265` 会输出为 `HEVC`。
+- `H264`、`H.264`、`x264` 会输出为 `AVC`。
+- 其他编码会尽量输出标准名称。
 
-### 4.8 设置
+## 115 STRM 和 302 播放
 
-设置页按顶部 Tab 分组：
+### 同步逻辑
 
-- `基础`：本地目录、TMDB、网络代理。
-- `云端`：CloudDrive2。
-- `115`：Cookies、Open Token、CID、STRM。
-- `Emby`：反代与媒体服务器。
+点击 `同步 STRM` 后：
 
-所有需要反馈的操作都会通过右上角 Toast 显示。
+1. Curio 读取配置的 115 媒体库 CID。
+2. 优先使用 Cookies 下载 115 导出的目录树。
+3. 如果没有可用 Cookies，则使用 Open API 递归扫描目录。
+4. 过滤媒体文件并生成 STRM。
+5. 将 STRM 记录写入数据库。
+6. 与上一次快照对比，新增、更新或删除本地 STRM。
 
-## 5. 整理流程
+点击 `同步操作记录` 后：
 
-### 5.1 本地整理
+1. Curio 读取 115 操作记录事件流。
+2. 根据新增、删除、移动、重命名事件更新节点表。
+3. 只处理配置 CID 范围内的数据。
+4. 根据变化增量更新 STRM。
 
-流程：
+开启定时同步后，Curio 会按设置的间隔自动执行增量同步。增量失败时可以再执行一次完整 STRM 同步修正快照。
 
-```text
-扫描文件
--> 过滤非媒体资源
--> 解析文件名
--> 按需 ffprobe 获取真实技术参数
--> TMDB 识别
--> 分类 YAML 匹配
--> 命名模板生成目标路径
--> 移动媒体文件
--> 移动字幕
--> 删除空文件夹
--> 更新数据库状态
-```
+### 播放逻辑
 
-非媒体文件不会进入状态机。
-
-### 5.2 云端整理
-
-流程和本地整理相同，但文件操作通过 CloudDrive2 完成。
-
-云端整理会：
-
-- 识别 CloudDrive2 路径。
-- 移动云端媒体文件。
-- 同步移动字幕。
-- 清理空目录。
-
-### 5.3 字幕处理
-
-Curio 会移动同目录下的字幕文件。
-
-字幕语言后缀：
-
-- 简体中文字幕：`.chs`
-- 繁体中文字幕：`.cht`
-- 其他语言尽量保留或识别为对应后缀
-
-示例：
+STRM 内容会指向 Curio：
 
 ```text
-Movie.mkv
-Movie.zh-CN.srt
+http://你的Curio地址/play/115/媒体文件名?token=签名
 ```
 
-整理后：
+播放时：
 
-```text
-电影名 (2024) - 2160p HEVC.mkv
-电影名 (2024) - 2160p HEVC.chs.srt
-```
+1. 播放器请求 Curio。
+2. Curio 校验 token。
+3. Curio 使用播放器的 User-Agent 向 115 获取直链。
+4. Curio 返回 302。
+5. 播放器直接连接 115 播放。
 
-## 6. 115 STRM 与 302 播放
+媒体流量不经过 Curio 本机。
 
-### 6.1 STRM 生成
+## 页面说明
 
-点击 `设置 -> 115 -> 同步 STRM` 后：
+- 总览：查看服务状态、当前任务、最近批次和统计。
+- 扫描：启动本地整理、云端整理和停止任务。
+- 处理：查看处理中或计划中的媒体。
+- 完成：查看已归档媒体，支持搜索、详情、删除记录和重新归档。
+- 失败：查看失败记录，支持删除数据库记录和重新归档。
+- 剧集：按 TMDB 剧集聚合，查看季、集、缺失集和未播出集。
+- 合集：按 TMDB 合集聚合，查看已有电影、缺失电影和未上映电影。
+- 分类：编辑分类 YAML。
+- 命名：编辑命名模板，查看和复制可用字段。
+- 设置：按顶部 Tab 管理基础、云端、115、Emby 等设置。
 
-1. Curio 获取配置 CID 的目录树。
-2. 过滤媒体扩展名。
-3. 为每个媒体生成 STRM。
-4. 写入数据库 `strm_links`。
-5. 删除或标记已不存在的 STRM。
+## 环境变量
 
-STRM 内容示例：
+大多数配置都建议在前端设置页维护。compose 里通常只需要 `TZ` 和 `CURIO_PLAY_SECRET`。
 
-```text
-http://localhost:8080/play/115/电影名.iso?token=签名token
-```
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `TZ` | 无 | 容器时区，推荐 `Asia/Shanghai`。 |
+| `SERVER_ADDR` | `:8080` | Curio 后端监听地址。镜像内默认不需要修改。 |
+| `DATABASE_URL` | `postgres://curio:curio@db:5432/curio?sslmode=disable` | PostgreSQL 连接串。使用仓库 compose 时不需要修改。 |
+| `REDIS_ADDR` | `redis:6379` | Redis 地址。使用仓库 compose 时不需要修改。 |
+| `REDIS_PASSWORD` | 空 | Redis 密码。 |
+| `CURIO_ADMIN_TOKEN` | 空 | 后台访问 Token。配置后前端需要登录，适合公网或 FRP 暴露场景。 |
+| `CURIO_PLAY_SECRET` | `curio-change-me` | 115 播放链接签名密钥，强烈建议修改。 |
+| `CURIO_DATA_ROOT` | `/data/Curio` | Curio 数据根目录。 |
+| `FRONTEND_DIR` | `/app/public` | 前端静态文件目录。镜像内默认不需要修改。 |
+| `FRONTEND_ORIGIN` | `*` | CORS 来源。 |
+| `TMDB_API_KEY` | 空 | 初始 TMDB API Key，也可以在前端设置页配置。 |
+| `NETWORK_PROXY` | 空 | 初始网络代理，也可以在前端设置页配置。 |
+| `TMDB_PROXY` | 空 | 兼容旧配置，优先级低于 `NETWORK_PROXY`。 |
+| `HTTPS_PROXY` | 空 | 兼容系统代理，优先级低于 `NETWORK_PROXY` 和 `TMDB_PROXY`。 |
+| `HTTP_PROXY` | 空 | 兼容系统代理，优先级最低。 |
+| `CLOUDDRIVE_ADDR` | `http://localhost:19798` | CloudDrive2 默认地址。现在推荐在前端设置页配置。 |
+| `CURIO_CD2_PROBE_MODE` | `auto` | CloudDrive2 技术参数探测模式，可选 `auto`、`direct`、`proxy`。 |
+| `CURIO_CD2_PREFETCH` | 自动 | 控制 CloudDrive2 ISO 采样预取提示。 |
+| `POSTGRES_DB` | 无 | PostgreSQL 初始化数据库名。compose 默认 `curio`。 |
+| `POSTGRES_USER` | 无 | PostgreSQL 初始化用户名。compose 默认 `curio`。 |
+| `POSTGRES_PASSWORD` | 无 | PostgreSQL 初始化密码。compose 默认 `curio`，生产环境建议修改。 |
 
-路径显示真实媒体名，鉴权 token 放在 query 参数里。
+## 常见问题
 
-### 6.2 302 播放
+### 115 提示限流
 
-播放器访问 STRM 后：
+常见原因：
 
-1. Curio 校验签名 token。
-2. 根据 STRM 记录找到 115 文件。
-3. 使用播放器 User-Agent 向 115 获取直链。
-4. 返回 302。
-
-媒体流量由播放器直连 115，不经过 Curio。
-
-### 6.3 目录树导出与扫描
-
-- 配置 Cookies：优先下载 115 导出的目录树文本。
-- 只有 Open Token：递归扫描 CID 下的完整目录。
-
-推荐配置 Cookies，减少 API 请求和限流概率。
-
-## 7. 常见问题
-
-### 7.1 115 请求达到访问上限
-
-这是 115 服务端限流。常见原因：
-
-- 连续同步 STRM。
-- Emby 扫描大量 STRM。
-- 播放器批量探测。
+- 频繁完整同步 STRM。
+- Emby 正在扫描大量 STRM。
+- 播放器批量探测媒体。
 - Open Token 模式递归扫描大目录。
 
-处理方式：
+建议：
 
-- 暂停 Emby 扫描。
+- 优先配置 Cookies，使用目录树导出。
+- 降低同步频率。
+- 不要连续点击完整同步。
 - 等待一段时间后重试。
-- 使用 Cookies 目录树导出。
-- 减少频繁点击同步。
+- 大目录优先使用操作记录增量同步。
 
-### 7.2 扫码状态刷新很慢
+### 只有 Open Token 时为什么同步慢
 
-115 状态接口可能会 long-poll，等待 20 到 30 秒是正常现象。
+Open Token 通常需要递归分页读取目录，目录越大请求越多。Cookies 可以使用 115 的目录树导出，通常更稳也更快。
 
-### 7.3 识别错误
+### 页面只显示部分记录
 
-在 `处理 / 完成 / 失败` 页面打开详情，使用 `重新归档`：
+列表默认分页加载，不会一次性加载全部数据库记录。使用搜索和翻页查看完整数据。
 
-- 电影可填写 TMDB ID。
-- 剧集可填写 TMDB ID、季、集和偏移。
-- 留空则按当前文件名重新识别。
+### 重新归档会删除真实文件吗
 
-### 7.4 页面只显示部分记录
+删除记录只删除数据库数据，不删除真实源文件。重新归档会按当前记录和输入参数重新识别或重新移动。
 
-列表采用分页加载，不会一次性加载全量数据。使用搜索和翻页查看更多记录。
+### 字幕如何命名
 
-### 7.5 Cookie 是否永久有效
+Curio 会识别同目录字幕，并根据语言生成后缀：
 
-不会永久有效。扫码获取的是较稳定的 115 登录态，但仍可能因服务端策略、IP、设备管理或账号安全策略失效。失效后重新扫码即可。
+- 简体中文：`.chs`
+- 繁体中文：`.cht`
 
-## 8. Docker 镜像
+无法识别的字幕会尽量保留原语言标记。
 
-本项目镜像包含：
+### Cookies 是否永久有效
 
-- Go backend
-- 前端 dist
-- ffmpeg / ffprobe
-- CA 证书
+不是。扫码获取的 Cookies 通常较稳定，但仍可能因为 115 服务端策略、IP、设备管理或账号安全策略失效。失效后重新扫码即可。
 
-默认 Compose 使用镜像：
+## 最近更新
 
-```text
-mon3trd/curio:latest
-```
+- 新增可选后台 Token 鉴权，适合公网或 FRP 暴露场景。
+- 敏感设置返回前端时进行脱敏，减少泄露风险。
+- 115 操作记录切换到新事件接口，并修复游标、分页、去重和增量同步一致性。
+- 恢复并增强 115 302 播放，支持 Cookies、Open Token 和多客户端兜底。
+- 新增 115 STRM 定时同步和过期 STRM 清理。
+- 优化目录树同步，优先使用 Cookies 导出目录树，减少大目录 API 请求。
+- 优化 CloudDrive2 探测和真实媒体参数读取，避免不需要技术字段时执行 `ffprobe`。
+- 优化日漫和中文剧集文件名清理，减少把发布组或根目录误识别为片名。
+- 优化字幕简繁识别和 `.chs`、`.cht` 后缀生成。
+- 优化处理、完成、失败页面的搜索、分页、详情弹窗、批量删除和重新归档。
+- 优化剧集和合集详情，补充缺失季、缺失集、未播出集和未上映电影统计。
+- 重新整理设置页为顶部 Tab 分组，并统一按钮、图标、圆角和提示风格。
 
-使用仓库内的 `docker-compose.yml` 运行：
-
-```bash
-docker compose up -d
-```
-
-默认会启动：
-
-- `db`：PostgreSQL 17，保存 Curio 数据。
-- `redis`：Redis 7，开启 AOF，并限制缓存内存为 `192mb`。
-- `curio`：Curio 主服务，对外暴露 `8080` 和 `8097`。
-
-默认挂载：
-
-- `./data:/data/Curio`
-- `./config:/config`
-- `curio_postgres:/var/lib/postgresql/data`
-- `curio_redis:/data`
-
-如果 Curio 需要访问宿主机代理，可以在页面设置中填写：
-
-```text
-http://host.docker.internal:7890
-```
-
-或单独运行 Curio 主服务：
-
-```bash
-docker run -d \
-  --name curio \
-  -p 8080:8080 \
-  -p 8097:8097 \
-  -e SERVER_ADDR=:8080 \
-  -e DATABASE_URL='postgres://curio:curio@db:5432/curio?sslmode=disable' \
-  -e REDIS_ADDR='redis:6379' \
-  -e FRONTEND_DIR=/app/public \
-  -e CURIO_DATA_ROOT=/data/Curio \
-  -e CURIO_PLAY_SECRET='change-me' \
-  -v ./data:/data/Curio \
-  -v ./config:/config \
-  mon3trd/curio:latest
-```
-
-单独运行时仍需要准备可访问的 PostgreSQL 和 Redis。
-
-## 9. 安全建议
+## 安全建议
 
 - 不要公开 TMDB Key、115 Cookies、Open Token、Emby API Key。
-- `CURIO_PLAY_SECRET` 应设置为随机长字符串。
+- `CURIO_PLAY_SECRET` 必须修改为随机长字符串。
+- 如果通过公网或 FRP 暴露 Curio，建议配置 `CURIO_ADMIN_TOKEN`。
 - 115 播放 URL 中的 `token` 有播放权限，不要公开分享。
-- 反代端口只暴露给可信网络或通过网关鉴权。
+- Emby 反代端口只建议暴露给可信网络。

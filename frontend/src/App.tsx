@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  Clock3,
   Cloud,
   CloudCheck,
   CloudCog,
@@ -20,6 +21,7 @@ import {
   FolderOpen,
   HardDrive,
   HardDriveDownload,
+  History,
   Eye,
   EyeOff,
   Import,
@@ -49,12 +51,13 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent, ReactNode } from 'react';
-import { API_URL, endpoints } from './api';
+import { API_URL, endpoints, getAuthToken, isAuthError, setAuthToken } from './api';
 import type {
   Batch,
   CloudDriveFile,
   CloudDriveSettings,
   Collection,
+  CollectionPage,
   DirectoryConfig,
   Health,
   MediaFile,
@@ -63,9 +66,11 @@ import type {
   NamingTemplate,
   P115QRCodeSession,
   P115Settings,
+  P115SyncRun,
   RearchivePayload,
   SystemSettings,
   TVShow,
+  TVShowPage,
 } from './types';
 
 type Page =
@@ -89,6 +94,8 @@ type P115TextKey = Exclude<
   | 'cookie_login_app'
   | 'stale_before_delete'
   | 'refresh_emby_after_sync'
+  | 'sync_cron_enabled'
+  | 'sync_interval_minutes'
   | 'updated_at'
 >;
 type ToastState = { id: number; message: string; tone: 'success' | 'error' | 'info' };
@@ -177,6 +184,8 @@ const emptyP115: P115Settings = {
   delete_missing_strm: true,
   stale_before_delete: false,
   refresh_emby_after_sync: false,
+  sync_cron_enabled: false,
+  sync_interval_minutes: 60,
   emby_upstream_url: '',
   emby_public_url: '',
   emby_proxy_port: 8097,
@@ -206,7 +215,42 @@ const emptyStats: MediaStats = {
 
 const mediaPageLimit = 50;
 const emptyMediaPage: MediaFilePage = { items: [], total: 0, limit: mediaPageLimit, offset: 0 };
+const emptyTVShowPage: TVShowPage = { items: [], total: 0, limit: mediaPageLimit, offset: 0 };
+const emptyCollectionPage: CollectionPage = { items: [], total: 0, limit: mediaPageLimit, offset: 0 };
+
+function arrayOrEmpty<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeMediaPage(value: MediaFilePage | null | undefined): MediaFilePage {
+  return {
+    items: arrayOrEmpty(value?.items),
+    total: Number.isFinite(value?.total) ? Number(value?.total) : 0,
+    limit: Number.isFinite(value?.limit) && Number(value?.limit) > 0 ? Number(value?.limit) : mediaPageLimit,
+    offset: Number.isFinite(value?.offset) && Number(value?.offset) >= 0 ? Number(value?.offset) : 0,
+  };
+}
+
+function normalizeTVShowPage(value: TVShowPage | null | undefined): TVShowPage {
+  return {
+    items: arrayOrEmpty(value?.items),
+    total: Number.isFinite(value?.total) ? Number(value?.total) : 0,
+    limit: Number.isFinite(value?.limit) && Number(value?.limit) > 0 ? Number(value?.limit) : mediaPageLimit,
+    offset: Number.isFinite(value?.offset) && Number(value?.offset) >= 0 ? Number(value?.offset) : 0,
+  };
+}
+
+function normalizeCollectionPage(value: CollectionPage | null | undefined): CollectionPage {
+  return {
+    items: arrayOrEmpty(value?.items),
+    total: Number.isFinite(value?.total) ? Number(value?.total) : 0,
+    limit: Number.isFinite(value?.limit) && Number(value?.limit) > 0 ? Number(value?.limit) : mediaPageLimit,
+    offset: Number.isFinite(value?.offset) && Number(value?.offset) >= 0 ? Number(value?.offset) : 0,
+  };
+}
+
 type MediaMode = 'processing' | 'staging' | 'failed';
+const processingStatuses = ['incoming', 'scanned', 'parsed', 'scraped', 'matched', 'collection_checked', 'planned'].join(',');
 type RearchiveDraft = {
   tmdbID: string;
   mediaType: 'movie' | 'tv_episode';
@@ -240,21 +284,26 @@ export default function App() {
   const [systemSettings, setSystemSettings] = useState<SystemSettings>(emptySettings);
   const [cloudDriveSettings, setCloudDriveSettings] = useState<CloudDriveSettings>(emptyCloudDrive);
   const [p115Settings, setP115Settings] = useState<P115Settings>(emptyP115);
+  const [p115SyncRuns, setP115SyncRuns] = useState<P115SyncRun[]>([]);
   const [templates, setTemplates] = useState<NamingTemplate[]>([]);
   const [mediaPage, setMediaPage] = useState<MediaFilePage>(emptyMediaPage);
   const [stagingPage, setStagingPage] = useState<MediaFilePage>(emptyMediaPage);
   const [failedPage, setFailedPage] = useState<MediaFilePage>(emptyMediaPage);
+  const [tvShowPage, setTVShowPage] = useState<TVShowPage>(emptyTVShowPage);
+  const [collectionPage, setCollectionPage] = useState<CollectionPage>(emptyCollectionPage);
   const [mediaQuery, setMediaQueryState] = useState('');
   const [stagingQuery, setStagingQueryState] = useState('');
   const [failedQuery, setFailedQueryState] = useState('');
+  const [tvQuery, setTVQueryState] = useState('');
+  const [collectionQuery, setCollectionQueryState] = useState('');
   const [mediaOffset, setMediaOffsetState] = useState(0);
   const [stagingOffset, setStagingOffsetState] = useState(0);
   const [failedOffset, setFailedOffsetState] = useState(0);
+  const [tvOffset, setTVOffsetState] = useState(0);
+  const [collectionOffset, setCollectionOffsetState] = useState(0);
   const [selectedMedia, setSelectedMedia] = useState<string[]>([]);
   const [selectedStaging, setSelectedStaging] = useState<string[]>([]);
   const [selectedFailed, setSelectedFailed] = useState<string[]>([]);
-  const [tvShows, setTVShows] = useState<TVShow[]>([]);
-  const [collections, setCollections] = useState<Collection[]>([]);
   const [draftDirs, setDraftDirs] = useState<DirectoryConfig>(emptyDirs);
   const [draftSettings, setDraftSettings] = useState<SystemSettings>(emptySettings);
   const [draftCloudDrive, setDraftCloudDrive] = useState<CloudDriveSettings>(emptyCloudDrive);
@@ -280,14 +329,21 @@ export default function App() {
   });
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authTokenDraft, setAuthTokenDraft] = useState('');
   const draftsReady = useRef(false);
   const toastSeq = useRef(0);
   const mediaQueryRef = useRef('');
   const stagingQueryRef = useRef('');
   const failedQueryRef = useRef('');
+  const tvQueryRef = useRef('');
+  const collectionQueryRef = useRef('');
   const mediaOffsetRef = useRef(0);
   const stagingOffsetRef = useRef(0);
   const failedOffsetRef = useRef(0);
+  const tvOffsetRef = useRef(0);
+  const collectionOffsetRef = useRef(0);
   const pageRef = useRef<Page>(page);
   const refreshTimerRef = useRef<number | null>(null);
   const mediaFiles = mediaPage.items;
@@ -298,6 +354,17 @@ export default function App() {
     toastSeq.current += 1;
     setToast({ id: toastSeq.current, message, tone });
   }, []);
+
+  const handleLoadError = useCallback(
+    (error: unknown, fallback = '数据加载失败') => {
+      if (isAuthError(error)) {
+        setAuthRequired(true);
+        return;
+      }
+      showToast(error instanceof Error ? error.message : fallback, 'error');
+    },
+    [showToast],
+  );
 
   const setPage = useCallback((next: Page) => {
     pageRef.current = next;
@@ -329,6 +396,20 @@ export default function App() {
     setSelectedFailed([]);
   }, []);
 
+  const setTVQuery = useCallback((value: string) => {
+    tvQueryRef.current = value;
+    tvOffsetRef.current = 0;
+    setTVQueryState(value);
+    setTVOffsetState(0);
+  }, []);
+
+  const setCollectionQuery = useCallback((value: string) => {
+    collectionQueryRef.current = value;
+    collectionOffsetRef.current = 0;
+    setCollectionQueryState(value);
+    setCollectionOffsetState(0);
+  }, []);
+
   const setMediaOffset = useCallback((value: number) => {
     const next = Math.max(0, value);
     mediaOffsetRef.current = next;
@@ -350,11 +431,26 @@ export default function App() {
     setSelectedFailed([]);
   }, []);
 
+  const setTVOffset = useCallback((value: number) => {
+    const next = Math.max(0, value);
+    tvOffsetRef.current = next;
+    setTVOffsetState(next);
+  }, []);
+
+  const setCollectionOffset = useCallback((value: number) => {
+    const next = Math.max(0, value);
+    collectionOffsetRef.current = next;
+    setCollectionOffsetState(next);
+  }, []);
+
   const load = useCallback(async (includeSettings = !draftsReady.current) => {
     const currentPage = pageRef.current;
     const loadMediaPage = currentPage === 'dashboard' || currentPage === 'scan' || currentPage === 'processing';
     const loadStagingPage = currentPage === 'staging';
     const loadFailedPage = currentPage === 'failed';
+    const loadTVPage = currentPage === 'tv';
+    const loadCollectionPage = currentPage === 'collections';
+    const loadSettingsPage = currentPage === 'settings';
     const [
       healthData,
       statsData,
@@ -365,13 +461,19 @@ export default function App() {
       failedData,
       tvShowData,
       collectionData,
+      p115RunsData,
     ] = await Promise.all([
       endpoints.health(),
       endpoints.stats(),
       endpoints.activeTask(),
       endpoints.batches(),
       loadMediaPage
-        ? endpoints.mediaFiles({ query: mediaQueryRef.current, offset: mediaOffsetRef.current, limit: mediaPageLimit })
+        ? endpoints.mediaFiles({
+            query: mediaQueryRef.current,
+            offset: mediaOffsetRef.current,
+            limit: mediaPageLimit,
+            status: currentPage === 'processing' ? processingStatuses : undefined,
+          })
         : Promise.resolve(null),
       loadStagingPage
         ? endpoints.staging({ query: stagingQueryRef.current, offset: stagingOffsetRef.current, limit: mediaPageLimit })
@@ -379,18 +481,22 @@ export default function App() {
       loadFailedPage
         ? endpoints.failed({ query: failedQueryRef.current, offset: failedOffsetRef.current, limit: mediaPageLimit })
         : Promise.resolve(null),
-      currentPage === 'tv' ? endpoints.tvShows() : Promise.resolve(null),
-      currentPage === 'collections' ? endpoints.collections() : Promise.resolve(null),
+      loadTVPage ? endpoints.tvShows({ query: tvQueryRef.current, offset: tvOffsetRef.current, limit: mediaPageLimit }) : Promise.resolve(null),
+      loadCollectionPage
+        ? endpoints.collections({ query: collectionQueryRef.current, offset: collectionOffsetRef.current, limit: mediaPageLimit })
+        : Promise.resolve(null),
+      loadSettingsPage ? endpoints.p115SyncRuns() : Promise.resolve(null),
     ]);
     setHealth(healthData);
     setStats(statsData);
     setActiveTask(activeData ?? healthData.active_task ?? null);
-    setBatches(batchData);
-    if (mediaData) setMediaPage(mediaData);
-    if (stagingData) setStagingPage(stagingData);
-    if (failedData) setFailedPage(failedData);
-    if (tvShowData) setTVShows(tvShowData);
-    if (collectionData) setCollections(collectionData);
+    setBatches(arrayOrEmpty(batchData));
+    if (loadMediaPage) setMediaPage(normalizeMediaPage(mediaData));
+    if (loadStagingPage) setStagingPage(normalizeMediaPage(stagingData));
+    if (loadFailedPage) setFailedPage(normalizeMediaPage(failedData));
+    if (loadTVPage) setTVShowPage(normalizeTVShowPage(tvShowData));
+    if (loadCollectionPage) setCollectionPage(normalizeCollectionPage(collectionData));
+    if (loadSettingsPage) setP115SyncRuns(arrayOrEmpty(p115RunsData));
 
     if (includeSettings) {
       const [dirData, settingsData, cloudDriveData, p115Data, templateData, classificationData] = await Promise.all([
@@ -405,14 +511,14 @@ export default function App() {
       setSystemSettings(settingsData);
       setCloudDriveSettings(cloudDriveData);
       setP115Settings(p115Data);
-      setTemplates(templateData);
+      setTemplates(arrayOrEmpty(templateData));
       if (!draftsReady.current) {
         setDraftDirs(dirData);
         setDraftSettings(settingsData);
         setDraftCloudDrive(cloudDriveData);
         setDraftP115(p115Data);
-        setDraftTemplates(templateData);
-        setDraftClassification(classificationData.classification_yaml);
+        setDraftTemplates(arrayOrEmpty(templateData));
+        setDraftClassification(classificationData?.classification_yaml ?? '');
         setCloudDrivePath(cloudDriveData.root_path || '/');
         draftsReady.current = true;
       }
@@ -431,7 +537,28 @@ export default function App() {
   );
 
   useEffect(() => {
-    load().catch((error) => showToast(error instanceof Error ? error.message : '数据加载失败', 'error'));
+    let closed = false;
+    endpoints
+      .authStatus()
+      .then((status) => {
+        if (closed) return;
+        const needsToken = status.enabled && !getAuthToken();
+        setAuthRequired(needsToken);
+        setAuthChecked(true);
+      })
+      .catch((error) => {
+        if (closed) return;
+        setAuthChecked(true);
+        handleLoadError(error, '鉴权状态读取失败');
+      });
+    return () => {
+      closed = true;
+    };
+  }, [handleLoadError]);
+
+  useEffect(() => {
+    if (!authChecked || authRequired) return undefined;
+    load().catch(handleLoadError);
     if (typeof EventSource === 'undefined') {
       const timer = window.setInterval(() => scheduleLoad(false, 0), 8000);
       return () => {
@@ -439,24 +566,29 @@ export default function App() {
         if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
       };
     }
-    const events = new EventSource(`${API_URL}/api/events`);
+    const eventURL = new URL(`${API_URL}/api/events`, window.location.origin);
+    const token = getAuthToken();
+    if (token) eventURL.searchParams.set('token', token);
+    const events = new EventSource(eventURL.toString());
     events.onmessage = () => scheduleLoad(false);
     events.onerror = () => undefined;
     return () => {
       events.close();
       if (refreshTimerRef.current) window.clearTimeout(refreshTimerRef.current);
     };
-  }, [load, scheduleLoad, showToast]);
+  }, [authChecked, authRequired, handleLoadError, load, scheduleLoad]);
 
   useEffect(() => {
+    if (!authChecked || authRequired) return;
     pageRef.current = page;
-    load(false).catch(() => undefined);
-  }, [page, load]);
+    load(false).catch(handleLoadError);
+  }, [authChecked, authRequired, page, load, handleLoadError]);
 
   useEffect(() => {
+    if (!authChecked || authRequired) return undefined;
     const timer = window.setTimeout(() => load(false).catch(() => undefined), 260);
     return () => window.clearTimeout(timer);
-  }, [mediaQuery, stagingQuery, failedQuery, mediaOffset, stagingOffset, failedOffset, load]);
+  }, [authChecked, authRequired, mediaQuery, stagingQuery, failedQuery, tvQuery, collectionQuery, mediaOffset, stagingOffset, failedOffset, tvOffset, collectionOffset, load]);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -559,15 +691,19 @@ export default function App() {
     }
     setBusy(true);
     try {
+      let successCount = 1;
+      let failedCount = 0;
       if (rearchiveTargets.length === 1) {
         await endpoints.rearchiveMediaFile(rearchiveTargets[0].file_id, payload);
       } else {
-        await endpoints.rearchiveMediaFiles(
+        const result = await endpoints.rearchiveMediaFiles(
           rearchiveTargets.map((file) => file.file_id),
           payload,
         );
+        successCount = result.count;
+        failedCount = result.failed ?? 0;
       }
-      showToast(`已重新归档 ${rearchiveTargets.length} 条记录`, 'success');
+      showToast(failedCount > 0 ? `重新归档完成：成功 ${successCount}，失败 ${failedCount}` : `已重新归档 ${successCount} 条记录`, failedCount > 0 ? 'error' : 'success');
       setRearchiveTargets([]);
       clearSelected();
       await load(false);
@@ -817,9 +953,10 @@ export default function App() {
     setBusy(true);
     try {
       const result = await endpoints.exportP115Tree();
-      showToast(`目录树已导出：${result.exported} 项，媒体 ${result.skipped} 个，失败 ${result.failed} 个`, result.failed > 0 ? 'error' : 'success');
+      showToast(`目录快照已刷新：${result.exported} 项，媒体 ${result.skipped} 个，失败 ${result.failed} 个`, result.failed > 0 ? 'error' : 'success');
+      void endpoints.p115SyncRuns().then((runs) => setP115SyncRuns(arrayOrEmpty(runs))).catch(() => undefined);
     } catch (error) {
-      showToast(error instanceof Error ? error.message : '目录树导出失败', 'error');
+      showToast(error instanceof Error ? error.message : '目录快照刷新失败', 'error');
     } finally {
       setBusy(false);
     }
@@ -829,10 +966,12 @@ export default function App() {
     setBusy(true);
     try {
       const result = await endpoints.syncP115STRM();
+      const source = result.mode === 'snapshot' ? '快照' : '远端';
       showToast(
-        `STRM 已同步：新增 ${result.generated}，恢复 ${result.restored ?? 0}，更新 ${result.updated}，删除 ${result.deleted}，跳过 ${result.skipped}，失败 ${result.failed}`,
+        `STRM 已同步：来源 ${source}，新增 ${result.generated}，恢复 ${result.restored ?? 0}，更新 ${result.updated}，删除 ${result.deleted}，跳过 ${result.skipped}，失败 ${result.failed}`,
         result.failed > 0 ? 'error' : 'success',
       );
+      void endpoints.p115SyncRuns().then((runs) => setP115SyncRuns(arrayOrEmpty(runs))).catch(() => undefined);
     } catch (error) {
       showToast(error instanceof Error ? error.message : 'STRM 同步失败', 'error');
     } finally {
@@ -845,6 +984,7 @@ export default function App() {
     try {
       const result = await endpoints.cleanupP115STRM();
       showToast(`孤儿 STRM 已清理：删除 ${result.deleted} 个，失败 ${result.failed} 个`, result.failed > 0 ? 'error' : 'success');
+      void endpoints.p115SyncRuns().then((runs) => setP115SyncRuns(arrayOrEmpty(runs))).catch(() => undefined);
     } catch (error) {
       showToast(error instanceof Error ? error.message : 'STRM 清理失败', 'error');
     } finally {
@@ -856,11 +996,33 @@ export default function App() {
     setBusy(true);
     try {
       const files = await endpoints.cloudDriveFiles(path);
-      setCloudDriveFiles(files);
+      setCloudDriveFiles(arrayOrEmpty(files));
       setCloudDrivePath(path);
       showToast('云端目录已打开', 'success');
     } catch (error) {
       showToast(error instanceof Error ? error.message : '云端目录读取失败', 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loginWithToken() {
+    const token = authTokenDraft.trim();
+    if (!token) {
+      showToast('请输入管理令牌', 'error');
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await endpoints.authLogin(token);
+      if (result.enabled) setAuthToken(token);
+      setAuthRequired(false);
+      setAuthTokenDraft('');
+      draftsReady.current = false;
+      await load(true);
+      showToast('登录成功', 'success');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '登录失败', 'error');
     } finally {
       setBusy(false);
     }
@@ -872,10 +1034,28 @@ export default function App() {
       await load(true);
       showToast('数据已刷新', 'success');
     } catch (error) {
-      showToast(error instanceof Error ? error.message : '刷新失败', 'error');
+      handleLoadError(error, '刷新失败');
     } finally {
       setRefreshing(false);
     }
+  }
+
+  if (!authChecked) {
+    return (
+      <>
+        <AuthScreen loading token={authTokenDraft} setToken={setAuthTokenDraft} onSubmit={loginWithToken} busy={busy} />
+        <ToastHost toast={toast} />
+      </>
+    );
+  }
+
+  if (authRequired) {
+    return (
+      <>
+        <AuthScreen token={authTokenDraft} setToken={setAuthTokenDraft} onSubmit={loginWithToken} busy={busy} />
+        <ToastHost toast={toast} />
+      </>
+    );
   }
 
   return (
@@ -1012,8 +1192,16 @@ export default function App() {
                 busy={busy}
               />
             )}
-            {page === 'tv' && <TVShows items={tvShows ?? []} />}
-            {page === 'collections' && <Collections items={collections ?? []} />}
+            {page === 'tv' && <TVShows page={tvShowPage} query={tvQuery} setQuery={setTVQuery} offset={tvOffset} setOffset={setTVOffset} />}
+            {page === 'collections' && (
+              <Collections
+                page={collectionPage}
+                query={collectionQuery}
+                setQuery={setCollectionQuery}
+                offset={collectionOffset}
+                setOffset={setCollectionOffset}
+              />
+            )}
             {page === 'classification' && (
               <ClassificationPage value={draftClassification} setValue={setDraftClassification} onSave={saveClassification} busy={busy} />
             )}
@@ -1038,6 +1226,7 @@ export default function App() {
                 p115QRStatus={p115QRStatus}
                 p115OAuthRedirect={p115OAuthRedirect}
                 p115TokenDraft={p115TokenDraft}
+                p115SyncRuns={p115SyncRuns}
                 cloudDriveFiles={cloudDriveFiles}
                 cloudDrivePath={cloudDrivePath}
                 busy={busy}
@@ -1079,6 +1268,62 @@ export default function App() {
       />
       <ToastHost toast={toast} />
     </div>
+  );
+}
+
+function AuthScreen({
+  token,
+  setToken,
+  onSubmit,
+  busy,
+  loading = false,
+}: {
+  token: string;
+  setToken: (value: string) => void;
+  onSubmit: () => void;
+  busy: boolean;
+  loading?: boolean;
+}) {
+  return (
+    <main className="authShell">
+      <motion.section
+        className="authCard"
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.22, ease: [0.2, 0, 0, 1] }}
+      >
+        <div className="brand authBrand">
+          <img className="brandIcon" src="/curio-icon.svg" alt="" aria-hidden="true" />
+          <span>Curio</span>
+        </div>
+        {loading ? (
+          <div className="authLoading">
+            <RefreshCw size={18} className="spinIcon" />
+            <span>正在连接</span>
+          </div>
+        ) : (
+          <>
+            <label className="field">
+              <span>管理令牌</span>
+              <input
+                value={token}
+                type="password"
+                autoComplete="current-password"
+                spellCheck={false}
+                onChange={(event) => setToken(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') onSubmit();
+                }}
+              />
+            </label>
+            <button className="primary authSubmit" onClick={onSubmit} disabled={busy} type="button">
+              <LogIn size={17} />
+              <span>登录</span>
+            </button>
+          </>
+        )}
+      </motion.section>
+    </main>
   );
 }
 
@@ -1422,8 +1667,20 @@ function TableSearch({ value, onChange }: { value: string; onChange: (value: str
   );
 }
 
-function TVShows({ items }: { items: TVShow[] }) {
-  const rows = items ?? [];
+function TVShows({
+  page,
+  query,
+  setQuery,
+  offset,
+  setOffset,
+}: {
+  page: TVShowPage;
+  query: string;
+  setQuery: (value: string) => void;
+  offset: number;
+  setOffset: (value: number) => void;
+}) {
+  const rows = page.items ?? [];
   const [selected, setSelected] = useState<TVShow | null>(null);
   const [detail, setDetail] = useState<TVShow | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1449,7 +1706,7 @@ function TVShows({ items }: { items: TVShow[] }) {
 
   return (
     <>
-      <Block title="剧集状态">
+      <Block title="剧集状态" action={<TableSearch value={query} onChange={setQuery} />}>
         <table className="showsTable">
           <thead>
             <tr>
@@ -1495,6 +1752,7 @@ function TVShows({ items }: { items: TVShow[] }) {
             )}
           </tbody>
         </table>
+        <TablePager page={page} offset={offset} setOffset={setOffset} />
       </Block>
 
       <AnimatePresence>
@@ -1612,8 +1870,20 @@ function TVSeasonGroup({ season }: { season: NonNullable<TVShow['seasons']>[numb
   );
 }
 
-function Collections({ items }: { items: Collection[] }) {
-  const rows = items ?? [];
+function Collections({
+  page,
+  query,
+  setQuery,
+  offset,
+  setOffset,
+}: {
+  page: CollectionPage;
+  query: string;
+  setQuery: (value: string) => void;
+  offset: number;
+  setOffset: (value: number) => void;
+}) {
+  const rows = page.items ?? [];
   const [selected, setSelected] = useState<Collection | null>(null);
   const [detail, setDetail] = useState<Collection | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1639,7 +1909,7 @@ function Collections({ items }: { items: Collection[] }) {
 
   return (
     <>
-      <Block title="合集状态">
+      <Block title="合集状态" action={<TableSearch value={query} onChange={setQuery} />}>
         <table className="collectionsTable">
           <thead>
             <tr>
@@ -1686,6 +1956,7 @@ function Collections({ items }: { items: Collection[] }) {
             )}
           </tbody>
         </table>
+        <TablePager page={page} offset={offset} setOffset={setOffset} />
       </Block>
 
       <AnimatePresence>
@@ -2076,6 +2347,7 @@ function SettingsPage({
   p115QRStatus,
   p115OAuthRedirect,
   p115TokenDraft,
+  p115SyncRuns,
   cloudDriveFiles,
   cloudDrivePath,
   busy,
@@ -2111,6 +2383,7 @@ function SettingsPage({
   p115QRStatus: string;
   p115OAuthRedirect: string;
   p115TokenDraft: P115TokenDraft;
+  p115SyncRuns: P115SyncRun[];
   cloudDriveFiles: CloudDriveFile[];
   cloudDrivePath: string;
   busy: boolean;
@@ -2450,10 +2723,36 @@ function SettingsPage({
       </Block>
 
       <Block title="STRM 操作">
+        <div className="formGrid settingsFormGrid scheduleGrid">
+          <label className="checkLine">
+            <input
+              type="checkbox"
+              checked={p115Settings.sync_cron_enabled}
+              onChange={(event) => setP115Settings({ ...p115Settings, sync_cron_enabled: event.target.checked })}
+            />
+            <span>定时增量同步</span>
+          </label>
+          <label className="field">
+            <span>同步间隔（分钟）</span>
+            <input
+              type="number"
+              min="5"
+              max="10080"
+              value={p115Settings.sync_interval_minutes || 60}
+              onChange={(event) =>
+                setP115Settings({ ...p115Settings, sync_interval_minutes: Number.parseInt(event.target.value, 10) || 60 })
+              }
+            />
+          </label>
+        </div>
         <div className="settingsActions">
-          <button className="secondaryAction" onClick={exportP115Tree} disabled={busy} title="导出目录树">
+          <button className="primary" onClick={saveP115} disabled={busy} title="保存 STRM 设置">
+            <Clock3 size={17} />
+            <span>保存定时</span>
+          </button>
+          <button className="secondaryAction" onClick={exportP115Tree} disabled={busy} title="刷新 115 目录快照">
             <FolderOpen size={17} />
-            <span>导出目录树</span>
+            <span>刷新快照</span>
           </button>
           <button className="secondaryAction" onClick={syncP115STRM} disabled={busy} title="同步 STRM">
             <FileSymlink size={17} />
@@ -2464,6 +2763,11 @@ function SettingsPage({
             <span>清理孤儿</span>
           </button>
         </div>
+        <div className="syncHistoryHeader">
+          <History size={17} />
+          <span>同步记录</span>
+        </div>
+        <P115SyncRunTable rows={p115SyncRuns} />
       </Block>
         </motion.div>
       )}
@@ -2567,6 +2871,48 @@ function CloudDriveTable({ rows, onOpen }: { rows: CloudDriveFile[]; onOpen: (pa
         )}
       </tbody>
     </table>
+  );
+}
+
+function P115SyncRunTable({ rows }: { rows: P115SyncRun[] }) {
+  return (
+    <div className="tableFrame syncRunTable">
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>来源</th>
+            <th>状态</th>
+            <th>模式</th>
+            <th>结果</th>
+            <th>耗时</th>
+            <th>错误</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((run) => (
+            <tr key={run.id}>
+              <td>{formatFullDate(run.started_at)}</td>
+              <td>{p115TriggerLabel(run.trigger)}</td>
+              <td>
+                <span className={`syncStatus ${run.status}`}>{p115SyncStatusLabel(run.status)}</span>
+              </td>
+              <td>{p115ModeLabel(run.mode)}</td>
+              <td>{`新增 ${run.generated} / 更新 ${run.updated} / 删除 ${run.deleted} / 失败 ${run.failed}`}</td>
+              <td>{formatDuration(run.duration_ms)}</td>
+              <td title={run.error_message}>{run.error_message ? shortText(run.error_message, 28) : '-'}</td>
+            </tr>
+          ))}
+          {rows.length === 0 && (
+            <tr>
+              <td className="emptyCell" colSpan={7}>
+                暂无同步记录
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -3069,7 +3415,7 @@ function MediaRowActions({
   );
 }
 
-function TablePager({ page, offset, setOffset }: { page: MediaFilePage; offset: number; setOffset: (value: number) => void }) {
+function TablePager({ page, offset, setOffset }: { page: { total: number; limit: number }; offset: number; setOffset: (value: number) => void }) {
   const start = page.total === 0 ? 0 : offset + 1;
   const end = Math.min(offset + page.limit, page.total);
   const canPrev = offset > 0;
@@ -3256,13 +3602,15 @@ function formatSize(value: number) {
 
 function formatDate(value: string) {
   if (!value) return '';
-  return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(
-    new Date(value),
-  );
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(date);
 }
 
 function formatFullDate(value: string) {
   if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
   return new Intl.DateTimeFormat('zh-CN', {
     year: 'numeric',
     month: '2-digit',
@@ -3270,10 +3618,58 @@ function formatFullDate(value: string) {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
-  }).format(new Date(value));
+  }).format(date);
+}
+
+function formatDuration(value: number) {
+  if (!value) return '-';
+  if (value < 1000) return `${value} ms`;
+  const seconds = Math.round(value / 1000);
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分`;
+}
+
+function p115TriggerLabel(value: string) {
+  const labels: Record<string, string> = {
+    manual_export: '手动快照',
+    manual_sync: '手动同步',
+    manual_cleanup: '手动清理',
+    cron: '定时同步',
+  };
+  return labels[value] ?? value;
+}
+
+function p115SyncStatusLabel(value: string) {
+  const labels: Record<string, string> = {
+    running: '运行中',
+    success: '成功',
+    partial: '部分失败',
+    failed: '失败',
+  };
+  return labels[value] ?? value;
+}
+
+function p115ModeLabel(value: string) {
+  const labels: Record<string, string> = {
+    refresh: '快照',
+    events: '事件',
+    scan: '扫描',
+    cache: '缓存',
+    snapshot: '快照',
+    cleanup: '清理',
+    sync: '同步',
+  };
+  return labels[value] ?? (value || '-');
 }
 
 function shortPath(value: string) {
   if (!value) return '';
   return value.length > 58 ? `...${value.slice(-55)}` : value;
+}
+
+function shortText(value: string, max = 58) {
+  if (!value) return '';
+  return value.length > max ? `${value.slice(0, max - 3)}...` : value;
 }

@@ -202,7 +202,7 @@ func scanWalk(ctx context.Context, client *clouddrive.Client, dir string, files 
 			scanned.ErrorMessage = "unsupported extension"
 		} else if child.Size < scanner.MinFileSize {
 			scanned.ErrorCode = models.ErrFileTooSmall
-			scanned.ErrorMessage = fmt.Sprintf("file size %d is below 300MB", child.Size)
+			scanned.ErrorMessage = fmt.Sprintf("file size %d has no valid content", child.Size)
 		} else {
 			*media = *media + 1
 			if *media%100 == 0 {

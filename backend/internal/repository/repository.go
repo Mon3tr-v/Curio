@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"curio/internal/models"
 
@@ -71,6 +72,8 @@ func (s *Store) Migrate(ctx context.Context) error {
 			stale_before_delete BOOLEAN NOT NULL DEFAULT false,
 			keep_deleted_days INT NOT NULL DEFAULT 7,
 			refresh_emby_after_sync BOOLEAN NOT NULL DEFAULT false,
+			sync_cron_enabled BOOLEAN NOT NULL DEFAULT false,
+			sync_interval_minutes INT NOT NULL DEFAULT 60,
 			emby_upstream_url TEXT NOT NULL DEFAULT '',
 			emby_public_url TEXT NOT NULL DEFAULT '',
 			emby_proxy_port INT NOT NULL DEFAULT 8097,
@@ -80,6 +83,8 @@ func (s *Store) Migrate(ctx context.Context) error {
 		)`,
 		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS cookie_login_app TEXT NOT NULL DEFAULT 'wechatmini'`,
 		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS emby_proxy_port INT NOT NULL DEFAULT 8097`,
+		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS sync_cron_enabled BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE p115_settings ADD COLUMN IF NOT EXISTS sync_interval_minutes INT NOT NULL DEFAULT 60`,
 		`CREATE TABLE IF NOT EXISTS strm_links (
 			id TEXT PRIMARY KEY,
 			provider TEXT NOT NULL,
@@ -113,14 +118,74 @@ func (s *Store) Migrate(ctx context.Context) error {
 			tree_version TEXT NOT NULL,
 			relative_path TEXT NOT NULL,
 			name TEXT NOT NULL,
+			remote_file_id TEXT NOT NULL DEFAULT '',
+			parent_file_id TEXT NOT NULL DEFAULT '',
+			pickcode TEXT NOT NULL DEFAULT '',
+			sha1 TEXT NOT NULL DEFAULT '',
+			size BIGINT NOT NULL DEFAULT 0,
 			extension TEXT NOT NULL DEFAULT '',
 			depth INT NOT NULL DEFAULT 0,
+			is_directory BOOLEAN NOT NULL DEFAULT false,
 			is_media BOOLEAN NOT NULL DEFAULT false,
 			source_tree_hash TEXT NOT NULL DEFAULT '',
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			PRIMARY KEY(library_cid, content_key)
 		)`,
+		`ALTER TABLE p115_tree_snapshots ADD COLUMN IF NOT EXISTS remote_file_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE p115_tree_snapshots ADD COLUMN IF NOT EXISTS parent_file_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE p115_tree_snapshots ADD COLUMN IF NOT EXISTS pickcode TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE p115_tree_snapshots ADD COLUMN IF NOT EXISTS sha1 TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE p115_tree_snapshots ADD COLUMN IF NOT EXISTS size BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE p115_tree_snapshots ADD COLUMN IF NOT EXISTS is_directory BOOLEAN NOT NULL DEFAULT false`,
 		`CREATE INDEX IF NOT EXISTS idx_p115_tree_snapshots_version ON p115_tree_snapshots(library_cid, tree_version)`,
+		`CREATE TABLE IF NOT EXISTS p115_nodes (
+			library_cid TEXT NOT NULL,
+			remote_file_id TEXT NOT NULL,
+			parent_file_id TEXT NOT NULL DEFAULT '',
+			tree_version TEXT NOT NULL DEFAULT '',
+			relative_path TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL,
+			pickcode TEXT NOT NULL DEFAULT '',
+			sha1 TEXT NOT NULL DEFAULT '',
+			size BIGINT NOT NULL DEFAULT 0,
+			is_directory BOOLEAN NOT NULL DEFAULT false,
+			is_media BOOLEAN NOT NULL DEFAULT false,
+			is_alive BOOLEAN NOT NULL DEFAULT true,
+			source_tree_hash TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY(library_cid, remote_file_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_p115_nodes_library_alive ON p115_nodes(library_cid, is_alive)`,
+		`CREATE INDEX IF NOT EXISTS idx_p115_nodes_library_parent ON p115_nodes(library_cid, parent_file_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_p115_nodes_library_path ON p115_nodes(library_cid, relative_path)`,
+		`CREATE TABLE IF NOT EXISTS p115_event_cursors (
+			library_cid TEXT PRIMARY KEY,
+			last_event_id BIGINT NOT NULL DEFAULT 0,
+			last_event_time BIGINT NOT NULL DEFAULT 0,
+			last_sync_status TEXT NOT NULL DEFAULT '',
+			last_sync_error TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE TABLE IF NOT EXISTS p115_sync_runs (
+			id TEXT PRIMARY KEY,
+			trigger TEXT NOT NULL DEFAULT 'manual_sync',
+			status TEXT NOT NULL DEFAULT 'running',
+			mode TEXT NOT NULL DEFAULT '',
+			tree_version TEXT NOT NULL DEFAULT '',
+			exported INT NOT NULL DEFAULT 0,
+			generated INT NOT NULL DEFAULT 0,
+			restored INT NOT NULL DEFAULT 0,
+			updated_count INT NOT NULL DEFAULT 0,
+			deleted_count INT NOT NULL DEFAULT 0,
+			skipped INT NOT NULL DEFAULT 0,
+			failed INT NOT NULL DEFAULT 0,
+			error_message TEXT NOT NULL DEFAULT '',
+			started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			ended_at TIMESTAMPTZ,
+			duration_ms BIGINT NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_p115_sync_runs_started ON p115_sync_runs(started_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_p115_sync_runs_trigger ON p115_sync_runs(trigger, started_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS emby_strm_items (
 			id TEXT PRIMARY KEY,
 			emby_server_id TEXT NOT NULL DEFAULT 'default',
@@ -477,12 +542,12 @@ func (s *Store) P115Settings(ctx context.Context) (models.P115Settings, error) {
 	var settings models.P115Settings
 	err := s.db.QueryRow(ctx, `SELECT enabled, auth_mode, app_id, app_secret, access_token, refresh_token, cookies, cookie_login_app,
 		strm_output_path, public_base_url, direct_url_ttl_seconds, user_agent_mode, fixed_user_agent, libraries_yaml,
-		delete_missing_strm, stale_before_delete, keep_deleted_days, refresh_emby_after_sync,
+		delete_missing_strm, stale_before_delete, keep_deleted_days, refresh_emby_after_sync, sync_cron_enabled, sync_interval_minutes,
 		emby_upstream_url, emby_public_url, emby_proxy_port, emby_proxy_base_path, emby_api_key, updated_at
 		FROM p115_settings WHERE id=1`).
 		Scan(&settings.Enabled, &settings.AuthMode, &settings.AppID, &settings.AppSecret, &settings.AccessToken, &settings.RefreshToken, &settings.Cookies, &settings.CookieLoginApp,
 			&settings.STRMOutputPath, &settings.PublicBaseURL, &settings.DirectURLTTLSeconds, &settings.UserAgentMode, &settings.FixedUserAgent, &settings.LibrariesYAML,
-			&settings.DeleteMissingSTRM, &settings.StaleBeforeDelete, &settings.KeepDeletedDays, &settings.RefreshEmbyAfterSync,
+			&settings.DeleteMissingSTRM, &settings.StaleBeforeDelete, &settings.KeepDeletedDays, &settings.RefreshEmbyAfterSync, &settings.SyncCronEnabled, &settings.SyncIntervalMinutes,
 			&settings.EmbyUpstreamURL, &settings.EmbyPublicURL, &settings.EmbyProxyPort, &settings.EmbyProxyBasePath, &settings.EmbyAPIKey, &settings.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		settings = models.P115Settings{
@@ -494,6 +559,7 @@ func (s *Store) P115Settings(ctx context.Context) (models.P115Settings, error) {
 			UserAgentMode:       "inherit",
 			DeleteMissingSTRM:   true,
 			KeepDeletedDays:     7,
+			SyncIntervalMinutes: 60,
 			EmbyProxyPort:       8097,
 			EmbyProxyBasePath:   "/emby",
 		}
@@ -509,17 +575,17 @@ func (s *Store) SaveP115Settings(ctx context.Context, settings models.P115Settin
 	_, err := s.db.Exec(ctx, `INSERT INTO p115_settings (
 		id, enabled, auth_mode, app_id, app_secret, access_token, refresh_token, cookies, cookie_login_app,
 		strm_output_path, public_base_url, direct_url_ttl_seconds, user_agent_mode, fixed_user_agent, libraries_yaml,
-		delete_missing_strm, stale_before_delete, keep_deleted_days, refresh_emby_after_sync,
+		delete_missing_strm, stale_before_delete, keep_deleted_days, refresh_emby_after_sync, sync_cron_enabled, sync_interval_minutes,
 		emby_upstream_url, emby_public_url, emby_proxy_port, emby_proxy_base_path, emby_api_key
-	) VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+	) VALUES (1,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 	ON CONFLICT (id) DO UPDATE SET
 		enabled=$1, auth_mode=$2, app_id=$3, app_secret=$4, access_token=$5, refresh_token=$6, cookies=$7, cookie_login_app=$8,
 		strm_output_path=$9, public_base_url=$10, direct_url_ttl_seconds=$11, user_agent_mode=$12, fixed_user_agent=$13, libraries_yaml=$14,
-		delete_missing_strm=$15, stale_before_delete=$16, keep_deleted_days=$17, refresh_emby_after_sync=$18,
-		emby_upstream_url=$19, emby_public_url=$20, emby_proxy_port=$21, emby_proxy_base_path=$22, emby_api_key=$23, updated_at=now()`,
+		delete_missing_strm=$15, stale_before_delete=$16, keep_deleted_days=$17, refresh_emby_after_sync=$18, sync_cron_enabled=$19, sync_interval_minutes=$20,
+		emby_upstream_url=$21, emby_public_url=$22, emby_proxy_port=$23, emby_proxy_base_path=$24, emby_api_key=$25, updated_at=now()`,
 		settings.Enabled, settings.AuthMode, settings.AppID, settings.AppSecret, settings.AccessToken, settings.RefreshToken, settings.Cookies, settings.CookieLoginApp,
 		settings.STRMOutputPath, settings.PublicBaseURL, settings.DirectURLTTLSeconds, settings.UserAgentMode, settings.FixedUserAgent, settings.LibrariesYAML,
-		settings.DeleteMissingSTRM, settings.StaleBeforeDelete, settings.KeepDeletedDays, settings.RefreshEmbyAfterSync,
+		settings.DeleteMissingSTRM, settings.StaleBeforeDelete, settings.KeepDeletedDays, settings.RefreshEmbyAfterSync, settings.SyncCronEnabled, settings.SyncIntervalMinutes,
 		settings.EmbyUpstreamURL, settings.EmbyPublicURL, settings.EmbyProxyPort, settings.EmbyProxyBasePath, settings.EmbyAPIKey)
 	if err != nil {
 		return models.P115Settings{}, err
@@ -702,6 +768,70 @@ func (s *Store) UpdateSTRMLinkPlayPath(ctx context.Context, id, playPath string)
 	return err
 }
 
+func (s *Store) CreateP115SyncRun(ctx context.Context, run models.P115SyncRun) error {
+	if run.Status == "" {
+		run.Status = models.P115SyncStatusRunning
+	}
+	if run.StartedAt.IsZero() {
+		run.StartedAt = time.Now()
+	}
+	_, err := s.db.Exec(ctx, `INSERT INTO p115_sync_runs
+		(id, trigger, status, mode, tree_version, exported, generated, restored, updated_count, deleted_count, skipped, failed, error_message, started_at, duration_ms)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+		run.ID, run.Trigger, run.Status, run.Mode, run.TreeVersion, run.Exported, run.Generated, run.Restored, run.Updated, run.Deleted, run.Skipped, run.Failed, run.ErrorMessage, run.StartedAt, run.DurationMS)
+	return err
+}
+
+func (s *Store) FinishP115SyncRun(ctx context.Context, run models.P115SyncRun) error {
+	_, err := s.db.Exec(ctx, `UPDATE p115_sync_runs SET
+		status=$2, mode=$3, tree_version=$4, exported=$5, generated=$6, restored=$7, updated_count=$8,
+		deleted_count=$9, skipped=$10, failed=$11, error_message=$12, ended_at=$13, duration_ms=$14
+		WHERE id=$1`,
+		run.ID, run.Status, run.Mode, run.TreeVersion, run.Exported, run.Generated, run.Restored, run.Updated,
+		run.Deleted, run.Skipped, run.Failed, run.ErrorMessage, run.EndedAt, run.DurationMS)
+	return err
+}
+
+func (s *Store) P115SyncRuns(ctx context.Context, limit int) ([]models.P115SyncRun, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	rows, err := s.db.Query(ctx, `SELECT id, trigger, status, mode, tree_version, exported, generated, restored, updated_count,
+		deleted_count, skipped, failed, error_message, started_at, ended_at, duration_ms
+		FROM p115_sync_runs ORDER BY started_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	runs := make([]models.P115SyncRun, 0)
+	for rows.Next() {
+		run, err := scanP115SyncRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
+func (s *Store) LatestP115SyncRun(ctx context.Context, triggers []string) (models.P115SyncRun, bool, error) {
+	if len(triggers) == 0 {
+		return models.P115SyncRun{}, false, nil
+	}
+	rows, err := s.db.Query(ctx, `SELECT id, trigger, status, mode, tree_version, exported, generated, restored, updated_count,
+		deleted_count, skipped, failed, error_message, started_at, ended_at, duration_ms
+		FROM p115_sync_runs WHERE trigger=ANY($1) ORDER BY started_at DESC LIMIT 1`, triggers)
+	if err != nil {
+		return models.P115SyncRun{}, false, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return models.P115SyncRun{}, false, rows.Err()
+	}
+	run, err := scanP115SyncRun(rows)
+	return run, err == nil, err
+}
+
 func (s *Store) ReplaceP115Snapshot(ctx context.Context, libraryCID, treeVersion string, items []models.P115TreeSnapshotItem) error {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -714,13 +844,147 @@ func (s *Store) ReplaceP115Snapshot(ctx context.Context, libraryCID, treeVersion
 	for _, item := range items {
 		contentKey := item.LibraryCID + ":" + item.RelativePath
 		if _, err := tx.Exec(ctx, `INSERT INTO p115_tree_snapshots
-			(library_cid, content_key, tree_version, relative_path, name, extension, depth, is_media, source_tree_hash)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-			libraryCID, contentKey, treeVersion, item.RelativePath, item.Name, item.Extension, item.Depth, item.IsMedia, item.SourceTreeHash); err != nil {
+			(library_cid, content_key, tree_version, relative_path, name, remote_file_id, parent_file_id, pickcode, sha1, size, extension, depth, is_directory, is_media, source_tree_hash)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+			libraryCID, contentKey, treeVersion, item.RelativePath, item.Name, item.RemoteFileID, item.ParentFileID, item.PickCode, item.SHA1, item.Size, item.Extension, item.Depth, item.IsDirectory, item.IsMedia, item.SourceTreeHash); err != nil {
 			return err
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+func (s *Store) P115Snapshot(ctx context.Context, libraryCID string) ([]models.P115TreeSnapshotItem, string, error) {
+	rows, err := s.db.Query(ctx, `SELECT library_cid, tree_version, relative_path, name, remote_file_id, parent_file_id, pickcode, sha1, size, extension, depth, is_directory, is_media, source_tree_hash
+		FROM p115_tree_snapshots WHERE library_cid=$1 ORDER BY relative_path`, libraryCID)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+	items := make([]models.P115TreeSnapshotItem, 0)
+	version := ""
+	for rows.Next() {
+		var item models.P115TreeSnapshotItem
+		if err := rows.Scan(&item.LibraryCID, &item.TreeVersion, &item.RelativePath, &item.Name, &item.RemoteFileID, &item.ParentFileID, &item.PickCode, &item.SHA1, &item.Size, &item.Extension, &item.Depth, &item.IsDirectory, &item.IsMedia, &item.SourceTreeHash); err != nil {
+			return nil, "", err
+		}
+		if version == "" {
+			version = item.TreeVersion
+		}
+		items = append(items, item)
+	}
+	return items, version, rows.Err()
+}
+
+func (s *Store) ReplaceP115Nodes(ctx context.Context, libraryCID, treeVersion string, nodes []models.P115Node) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `DELETE FROM p115_nodes WHERE library_cid=$1`, libraryCID); err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		if node.RemoteFileID == "" {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO p115_nodes
+			(library_cid, remote_file_id, parent_file_id, tree_version, relative_path, name, pickcode, sha1, size, is_directory, is_media, is_alive, source_tree_hash)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			libraryCID, node.RemoteFileID, node.ParentFileID, treeVersion, node.RelativePath, node.Name, node.PickCode, node.SHA1, node.Size, node.IsDirectory, node.IsMedia, node.IsAlive, node.SourceTreeHash); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) ReplaceP115NodesAndCursor(ctx context.Context, libraryCID, treeVersion string, nodes []models.P115Node, cursor models.P115EventCursor) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `DELETE FROM p115_nodes WHERE library_cid=$1`, libraryCID); err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		if node.RemoteFileID == "" {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO p115_nodes
+			(library_cid, remote_file_id, parent_file_id, tree_version, relative_path, name, pickcode, sha1, size, is_directory, is_media, is_alive, source_tree_hash)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			libraryCID, node.RemoteFileID, node.ParentFileID, treeVersion, node.RelativePath, node.Name, node.PickCode, node.SHA1, node.Size, node.IsDirectory, node.IsMedia, node.IsAlive, node.SourceTreeHash); err != nil {
+			return err
+		}
+	}
+	if cursor.LibraryCID == "" {
+		cursor.LibraryCID = libraryCID
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO p115_event_cursors
+		(library_cid, last_event_id, last_event_time, last_sync_status, last_sync_error)
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (library_cid) DO UPDATE SET
+			last_event_id=$2, last_event_time=$3, last_sync_status=$4, last_sync_error=$5, updated_at=now()`,
+		cursor.LibraryCID, cursor.LastEventID, cursor.LastEventTime, cursor.LastSyncStatus, cursor.LastSyncError); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) P115Nodes(ctx context.Context, libraryCID string, aliveOnly bool) ([]models.P115Node, string, error) {
+	query := `SELECT library_cid, remote_file_id, parent_file_id, tree_version, relative_path, name, pickcode, sha1, size, is_directory, is_media, is_alive, source_tree_hash, updated_at
+		FROM p115_nodes WHERE library_cid=$1`
+	if aliveOnly {
+		query += ` AND is_alive`
+	}
+	query += ` ORDER BY relative_path`
+	rows, err := s.db.Query(ctx, query, libraryCID)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+	nodes := make([]models.P115Node, 0)
+	version := ""
+	for rows.Next() {
+		var node models.P115Node
+		if err := rows.Scan(&node.LibraryCID, &node.RemoteFileID, &node.ParentFileID, &node.TreeVersion, &node.RelativePath, &node.Name, &node.PickCode, &node.SHA1, &node.Size, &node.IsDirectory, &node.IsMedia, &node.IsAlive, &node.SourceTreeHash, &node.UpdatedAt); err != nil {
+			return nil, "", err
+		}
+		if version == "" {
+			version = node.TreeVersion
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, version, rows.Err()
+}
+
+func (s *Store) P115NodeCount(ctx context.Context, libraryCID string) (int, error) {
+	var count int
+	err := s.db.QueryRow(ctx, `SELECT count(*) FROM p115_nodes WHERE library_cid=$1 AND is_alive`, libraryCID).Scan(&count)
+	return count, err
+}
+
+func (s *Store) P115EventCursor(ctx context.Context, libraryCID string) (models.P115EventCursor, error) {
+	var cursor models.P115EventCursor
+	err := s.db.QueryRow(ctx, `SELECT library_cid, last_event_id, last_event_time, last_sync_status, last_sync_error, updated_at
+		FROM p115_event_cursors WHERE library_cid=$1`, libraryCID).
+		Scan(&cursor.LibraryCID, &cursor.LastEventID, &cursor.LastEventTime, &cursor.LastSyncStatus, &cursor.LastSyncError, &cursor.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		cursor.LibraryCID = libraryCID
+		return cursor, nil
+	}
+	return cursor, err
+}
+
+func (s *Store) SaveP115EventCursor(ctx context.Context, cursor models.P115EventCursor) error {
+	_, err := s.db.Exec(ctx, `INSERT INTO p115_event_cursors
+		(library_cid, last_event_id, last_event_time, last_sync_status, last_sync_error)
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (library_cid) DO UPDATE SET
+			last_event_id=$2, last_event_time=$3, last_sync_status=$4, last_sync_error=$5, updated_at=now()`,
+		cursor.LibraryCID, cursor.LastEventID, cursor.LastEventTime, cursor.LastSyncStatus, cursor.LastSyncError)
+	return err
 }
 
 func (s *Store) UpsertEmbySTRMItem(ctx context.Context, item models.EmbySTRMItem) error {
@@ -877,7 +1141,7 @@ func (s *Store) Batches(ctx context.Context, limit int) ([]models.Batch, error) 
 		return nil, err
 	}
 	defer rows.Close()
-	var batches []models.Batch
+	batches := make([]models.Batch, 0)
 	for rows.Next() {
 		batch, err := scanBatch(rows)
 		if err != nil {
@@ -1079,9 +1343,10 @@ func (s *Store) ListMediaFiles(ctx context.Context, status, search string, limit
 		planned_target, move_attempts, last_verified_path, error_code, error_message, created_at, updated_at FROM media_files`
 	args := []any{}
 	conditions := []string{}
-	if status != "" {
-		args = append(args, status)
-		conditions = append(conditions, fmt.Sprintf("process_status=$%d", len(args)))
+	statuses := splitCSV(status)
+	if len(statuses) > 0 {
+		args = append(args, statuses)
+		conditions = append(conditions, fmt.Sprintf("process_status=ANY($%d)", len(args)))
 	}
 	if search != "" {
 		args = append(args, "%"+search+"%")
@@ -1208,18 +1473,34 @@ func (s *Store) DeleteTVEpisodesNotIn(ctx context.Context, showID int, episodeID
 	return err
 }
 
-func (s *Store) TVShows(ctx context.Context) ([]models.TVShowStatus, error) {
-	rows, err := s.db.Query(ctx, tvShowStatusSQL(`WHERE EXISTS (
+func (s *Store) TVShows(ctx context.Context, search string, limit, offset int) (models.TVShowPage, error) {
+	args := []any{models.StatusDone, models.StatusIncompleteCollection}
+	where := `WHERE EXISTS (
 		SELECT 1
 		FROM media_matches mm
 		JOIN media_files mf ON mf.id=mm.file_id
 		WHERE mm.show_tmdb_id=s.tmdb_id AND mf.process_status IN ($1,$2)
-	)`, `ORDER BY s.updated_at DESC`), models.StatusDone, models.StatusIncompleteCollection)
+	)`
+	if search = strings.TrimSpace(search); search != "" {
+		args = append(args, "%"+search+"%")
+		where += fmt.Sprintf(` AND (s.name ILIKE %[1]s OR s.original_name ILIKE %[1]s OR s.tmdb_id::TEXT ILIKE %[1]s OR s.overview ILIKE %[1]s)`, fmt.Sprintf("$%d", len(args)))
+	}
+	var total int
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*)::INT FROM tv_shows s `+where, args...).Scan(&total); err != nil {
+		return models.TVShowPage{}, err
+	}
+	args = append(args, limit, offset)
+	order := fmt.Sprintf(`ORDER BY s.updated_at DESC LIMIT $%d OFFSET $%d`, len(args)-1, len(args))
+	rows, err := s.db.Query(ctx, tvShowStatusSQL(where, order), args...)
 	if err != nil {
-		return nil, err
+		return models.TVShowPage{}, err
 	}
 	defer rows.Close()
-	return scanTVShowStatuses(rows)
+	items, err := scanTVShowStatuses(rows)
+	if err != nil {
+		return models.TVShowPage{}, err
+	}
+	return models.TVShowPage{Items: items, Total: total, Limit: limit, Offset: offset}, nil
 }
 
 func (s *Store) TVShow(ctx context.Context, id int) (models.TVShowStatus, error) {
@@ -1405,7 +1686,7 @@ func (s *Store) LocalCollectionMovieIDs(ctx context.Context, collectionID int) (
 		FROM media_matches mm
 		JOIN media_files mf ON mf.id=mm.file_id
 		JOIN collection_movies cm ON cm.movie_tmdb_id=mm.movie_tmdb_id
-		WHERE cm.collection_id=$1 AND mf.process_status IN ($2,$3)`,
+		WHERE cm.collection_id=$1 AND cm.released=true AND mf.process_status IN ($2,$3)`,
 		collectionID, models.StatusDone, models.StatusIncompleteCollection)
 	if err != nil {
 		return nil, err
@@ -1419,21 +1700,36 @@ func (s *Store) UpdateCollectionStatus(ctx context.Context, collectionID, localC
 	return err
 }
 
-func (s *Store) Collections(ctx context.Context) ([]models.CollectionMetadata, error) {
-	rows, err := s.db.Query(ctx, `SELECT tmdb_id, name, overview, movie_count, unreleased_count, local_count, status, poster_path, backdrop_path FROM collections ORDER BY updated_at DESC`)
+func (s *Store) Collections(ctx context.Context, search string, limit, offset int) (models.CollectionPage, error) {
+	args := []any{}
+	where := ""
+	if search = strings.TrimSpace(search); search != "" {
+		args = append(args, "%"+search+"%")
+		where = fmt.Sprintf(` WHERE (name ILIKE %[1]s OR tmdb_id::TEXT ILIKE %[1]s OR overview ILIKE %[1]s OR status ILIKE %[1]s)`, fmt.Sprintf("$%d", len(args)))
+	}
+	var total int
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*)::INT FROM collections`+where, args...).Scan(&total); err != nil {
+		return models.CollectionPage{}, err
+	}
+	args = append(args, limit, offset)
+	rows, err := s.db.Query(ctx, fmt.Sprintf(`SELECT tmdb_id, name, overview, movie_count, unreleased_count, local_count, status, poster_path, backdrop_path
+		FROM collections%s ORDER BY updated_at DESC LIMIT $%d OFFSET $%d`, where, len(args)-1, len(args)), args...)
 	if err != nil {
-		return nil, err
+		return models.CollectionPage{}, err
 	}
 	defer rows.Close()
 	collections := make([]models.CollectionMetadata, 0)
 	for rows.Next() {
 		var c models.CollectionMetadata
 		if err := rows.Scan(&c.TMDBID, &c.Name, &c.Overview, &c.MovieCount, &c.UnreleasedCount, &c.LocalCount, &c.Status, &c.PosterPath, &c.BackdropPath); err != nil {
-			return nil, err
+			return models.CollectionPage{}, err
 		}
 		collections = append(collections, c)
 	}
-	return collections, rows.Err()
+	if err := rows.Err(); err != nil {
+		return models.CollectionPage{}, err
+	}
+	return models.CollectionPage{Items: collections, Total: total, Limit: limit, Offset: offset}, nil
 }
 
 func (s *Store) Collection(ctx context.Context, id int) (models.CollectionMetadata, error) {
@@ -1549,6 +1845,17 @@ func scanSTRMLink(rows pgx.Rows) (models.STRMLink, error) {
 	return link, err
 }
 
+func scanP115SyncRun(rows pgx.Rows) (models.P115SyncRun, error) {
+	var run models.P115SyncRun
+	var ended sql.NullTime
+	err := rows.Scan(&run.ID, &run.Trigger, &run.Status, &run.Mode, &run.TreeVersion, &run.Exported, &run.Generated, &run.Restored,
+		&run.Updated, &run.Deleted, &run.Skipped, &run.Failed, &run.ErrorMessage, &run.StartedAt, &ended, &run.DurationMS)
+	if ended.Valid {
+		run.EndedAt = &ended.Time
+	}
+	return run, err
+}
+
 func scanInts(rows pgx.Rows) ([]int, error) {
 	values := make([]int, 0)
 	for rows.Next() {
@@ -1566,6 +1873,24 @@ func nullableInt(value int) any {
 		return nil
 	}
 	return value
+}
+
+func splitCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		items = append(items, item)
+	}
+	return items
 }
 
 func (s *Store) updateMediaStatus(ctx context.Context, id, status string, previous ...string) error {

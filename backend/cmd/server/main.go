@@ -64,8 +64,9 @@ func main() {
 		log.Fatal(err)
 	}
 	p115Service := p115.NewService(store)
+	p115Service.StartScheduler(ctx)
 	embyproxy.StartPortManager(ctx, store, p115Service)
-	handler := api.NewWithP115(store, workerService, scraperClient, redisClient, p115Service, cfg.FrontendOrigin, cfg.FrontendDir)
+	handler := api.NewWithP115(store, workerService, scraperClient, redisClient, p115Service, cfg.FrontendOrigin, cfg.FrontendDir, cfg.AdminToken)
 	log.Printf("curio listening on %s", cfg.Addr)
 	if err := http.ListenAndServe(cfg.Addr, handler); err != nil {
 		log.Fatal(err)

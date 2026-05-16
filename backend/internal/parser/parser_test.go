@@ -142,6 +142,54 @@ func TestParseNyaaChineseGroupEpisode(t *testing.T) {
 	}
 }
 
+func TestParseCloudRootDoesNotUseIncomingAsShowTitle(t *testing.T) {
+	result, err := ParsePath("/115open/incoming/[Nekomoe kissaten&VCB-Studio] Youkoso Jitsuryoku Shijou Shugi no Kyoushitsu e [05][Ma10p_1080p][x265_flac].mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsTV || result.ShowTitle != "Youkoso Jitsuryoku Shijou Shugi no Kyoushitsu e" || result.Season != 1 || result.Episode != 5 {
+		t.Fatalf("unexpected incoming-root anime parse: %+v", result)
+	}
+	for _, title := range result.SearchTitles {
+		if title == "Incoming" || title == "incoming" {
+			t.Fatalf("incoming directory leaked into search titles: %+v", result.SearchTitles)
+		}
+	}
+}
+
+func TestParseBroadcastPrefixedChineseTVTitle(t *testing.T) {
+	result, err := ParsePath("/115open/incoming/[中国广电重温经典频道 虹猫蓝兔七侠传].CWJDTV.Legend.of.Howie,Landau.and.the.Seven.Swordsmen.2006.S01.Complete.1080i.HDTV.AVC.DD5.1-QHstudIo/[中国广电重温经典频道 虹猫蓝兔七侠传].CWJDTV.Legend.of.Howie,Landau.and.the.Seven.Swordsmen.2006.S01E01.1080i.HDTV.AVC.DD5.1-QHstudIo.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsTV || result.ShowTitle != "虹猫蓝兔七侠传" || result.ShowYear != 2006 || result.Season != 1 || result.Episode != 1 {
+		t.Fatalf("unexpected broadcast-prefixed tv parse: %+v", result)
+	}
+	if len(result.SearchTitles) == 0 || result.SearchTitles[0] != "虹猫蓝兔七侠传" {
+		t.Fatalf("expected exact chinese title first, got %+v", result.SearchTitles)
+	}
+}
+
+func TestParseAnimeAbbreviationSeasonSuffix(t *testing.T) {
+	result, err := ParsePath("/115open/incoming/[DMG&VCB-Studio] Youzitsu2 [01][Ma10p_1080p][x265_flac_aac].mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsTV || result.ShowTitle != "Youzitsu" || result.Season != 2 || result.Episode != 1 {
+		t.Fatalf("unexpected anime season suffix parse: %+v", result)
+	}
+}
+
+func TestParseTHXVCBReleaseGroup(t *testing.T) {
+	result, err := Parse("[T.H.X&VCB-Studio] Hyouka [01][Ma10p_1080p][x265_flac_aac].mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsTV || result.ShowTitle != "Hyouka" || result.Season != 1 || result.Episode != 1 {
+		t.Fatalf("unexpected thx vcb parse: %+v", result)
+	}
+}
+
 func TestParseMultiEpisode(t *testing.T) {
 	result, err := Parse("Stargate.Atlantis.S01E01E02.2004.Blu-ray.x265.AC3.mkv")
 	if err != nil {

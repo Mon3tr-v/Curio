@@ -65,6 +65,44 @@ button:disabled {
   min-height: 100vh;
 }
 
+.authShell {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+}
+
+.authCard {
+  width: min(420px, 100%);
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.authBrand {
+  padding: 0;
+  margin-bottom: 22px;
+}
+
+.authSubmit {
+  width: 100%;
+  margin-top: 18px;
+}
+
+.authLoading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  min-height: 42px;
+}
+
+.spinIcon {
+  animation: spin 900ms linear infinite;
+}
+
 .sidebar {
   position: sticky;
   top: 0;
@@ -275,26 +313,35 @@ nav {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
   overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 10px;
+  border: 1px solid #dde3ee;
+  border-radius: 12px;
   background: var(--surface);
 }
 
 .metric {
+  position: relative;
   display: grid;
-  gap: 12px;
-  min-height: 108px;
-  padding: 20px;
-  border-right: 1px solid var(--line);
-  transition: background 180ms var(--ease);
+  align-content: center;
+  gap: 14px;
+  min-height: 112px;
+  padding: 22px 24px;
+  transition:
+    background 180ms var(--ease),
+    color 180ms var(--ease);
 }
 
 .metric:hover {
-  background: #fbfcff;
+  background: #f8fbff;
 }
 
-.metric:last-child {
-  border-right: 0;
+.metric:not(:last-child)::after {
+  position: absolute;
+  top: 20px;
+  right: 0;
+  bottom: 20px;
+  width: 1px;
+  background: #e7ebf2;
+  content: "";
 }
 
 .metric span,
@@ -308,9 +355,17 @@ th,
 }
 
 .metric strong {
-  font-size: 36px;
-  font-weight: 600;
-  line-height: 1;
+  color: #202124;
+  font-size: 34px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.04;
+}
+
+.metric span {
+  color: #5f6368;
+  font-size: 13px;
+  font-weight: 500;
 }
 
 .split,
@@ -460,9 +515,14 @@ tbody tr:hover {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  min-height: 54px;
-  padding: 0 18px;
+  min-height: 64px;
+  padding: 12px 18px;
   border-bottom: 1px solid var(--line);
+}
+
+.mediaBulkBar .rowActions,
+.tablePager .rowActions {
+  align-self: center;
 }
 
 .mediaBulkBar span,
@@ -756,7 +816,7 @@ textarea:focus {
   border-bottom: 0;
 }
 
-.rowActions {
+.templateRow .rowActions {
   align-self: end;
 }
 
@@ -1390,6 +1450,11 @@ pre {
   gap: 10px;
 }
 
+.scheduleGrid {
+  grid-template-columns: minmax(220px, 0.7fr) minmax(180px, 0.5fr);
+  align-items: end;
+}
+
 .checkLine {
   display: inline-flex;
   align-items: center;
@@ -1413,6 +1478,52 @@ pre {
 
 .blockTitle + .settingsActions {
   padding-top: 16px;
+}
+
+.syncHistoryHeader {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 16px 12px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.syncHistoryHeader svg {
+  color: #0b57d0;
+}
+
+.syncRunTable {
+  border-top: 1px solid var(--line);
+}
+
+.syncRunTable table {
+  min-width: 860px;
+}
+
+.syncStatus {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.syncStatus.success {
+  color: #0b8043;
+}
+
+.syncStatus.partial {
+  color: #b06000;
+}
+
+.syncStatus.failed {
+  color: #b3261e;
+}
+
+.syncStatus.running {
+  color: #0b57d0;
 }
 
 .settingsActions .primary,
@@ -1610,6 +1721,10 @@ pre {
     border-bottom: 1px solid var(--line);
   }
 
+  .metric:not(:last-child)::after {
+    display: none;
+  }
+
   .metric:last-child {
     border-bottom: 0;
   }
@@ -1756,6 +1871,40 @@ pre {
   .collectionPartItem {
     grid-template-columns: 1fr;
   }
+}
+
+.fatalShell {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+}
+
+.fatalPanel {
+  width: min(520px, 100%);
+  padding: 28px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.fatalPanel span {
+  color: var(--bad);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.fatalPanel h1 {
+  margin: 8px 0;
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.fatalPanel p {
+  margin: 0 0 20px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 @media (prefers-reduced-motion: reduce) {

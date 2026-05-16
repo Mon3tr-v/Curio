@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"curio/internal/clouddrive/pb"
 	"curio/internal/models"
@@ -251,17 +252,22 @@ func (d *DriveSession) List(ctx context.Context, dir string) ([]File, error) {
 	return d.s.list(ctx, dir)
 }
 
-func (d *DriveSession) Scan(ctx context.Context, root string) ([]scanner.File, error) {
+func (d *DriveSession) Scan(ctx context.Context, root string, excludes ...string) ([]scanner.File, error) {
 	files := make([]scanner.File, 0)
 	sidecars := make([]scanner.Sidecar, 0)
-	err := d.s.walk(ctx, NormalizePath(root), func(file File) {
+	excluded := normalizeExcludes(root, excludes)
+	err := d.s.walk(ctx, NormalizePath(root), func(file File) bool {
+		if remotePathExcluded(file.Path, excluded) {
+			return false
+		}
 		if scanned, ok := toScannedFile(file); ok {
 			files = append(files, scanned)
-			return
+			return true
 		}
 		if scanner.IsSubtitleExtension("." + file.Extension) {
 			sidecars = append(sidecars, scanner.Sidecar{Path: file.URI, Name: file.Name, Extension: file.Extension, Size: file.Size})
 		}
+		return true
 	})
 	return scanner.AttachSidecars(files, sidecars), err
 }
@@ -474,7 +480,13 @@ func (c *Client) connect(ctx context.Context) (*grpc.ClientConn, pb.CloudDriveFi
 	if secure {
 		creds = credentials.NewClientTLSFromCert(nil, "")
 	}
-	conn, err := grpc.DialContext(ctx, target, grpc.WithTransportCredentials(creds), grpc.WithBlock())
+	dialCtx := ctx
+	cancel := func() {}
+	if _, ok := ctx.Deadline(); !ok {
+		dialCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
+	}
+	defer cancel()
+	conn, err := grpc.DialContext(dialCtx, target, grpc.WithTransportCredentials(creds), grpc.WithBlock())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -531,7 +543,7 @@ func (s *session) list(ctx context.Context, dir string) ([]File, error) {
 	}
 }
 
-func (s *session) walk(ctx context.Context, dir string, visit func(File)) error {
+func (s *session) walk(ctx context.Context, dir string, visit func(File) bool) error {
 	files, err := s.list(ctx, dir)
 	if err != nil {
 		return err
@@ -541,6 +553,9 @@ func (s *session) walk(ctx context.Context, dir string, visit func(File)) error 
 			return ctx.Err()
 		}
 		if file.IsDirectory {
+			if !visit(file) {
+				continue
+			}
 			if err := s.walk(ctx, file.Path, visit); err != nil {
 				return err
 			}
@@ -549,6 +564,40 @@ func (s *session) walk(ctx context.Context, dir string, visit func(File)) error 
 		visit(file)
 	}
 	return nil
+}
+
+func normalizeExcludes(root string, excludes []string) []string {
+	root = NormalizePath(root)
+	values := make([]string, 0, len(excludes))
+	seen := map[string]struct{}{}
+	for _, item := range excludes {
+		value := NormalizePath(item)
+		if value == "/" || value == root || !remotePathWithin(value, root) {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+	return values
+}
+
+func remotePathExcluded(value string, excludes []string) bool {
+	value = NormalizePath(value)
+	for _, exclude := range excludes {
+		if value == exclude || strings.HasPrefix(value, exclude+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func remotePathWithin(value, root string) bool {
+	value = NormalizePath(value)
+	root = NormalizePath(root)
+	return root == "/" || value == root || strings.HasPrefix(value, root+"/")
 }
 
 func (s *session) ensureDir(ctx context.Context, dir string) error {
@@ -634,7 +683,7 @@ func toScannedFile(file File) (scanner.File, bool) {
 	}
 	if file.Size < scanner.MinFileSize {
 		scanned.ErrorCode = models.ErrFileTooSmall
-		scanned.ErrorMessage = fmt.Sprintf("文件大小 %d 小于 300MB", file.Size)
+		scanned.ErrorMessage = fmt.Sprintf("文件大小 %d，无有效内容", file.Size)
 	}
 	return scanned, true
 }

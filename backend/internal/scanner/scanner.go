@@ -14,7 +14,7 @@ import (
 	"curio/internal/models"
 )
 
-const MinFileSize int64 = 300 * 1024 * 1024
+const MinFileSize int64 = 1
 
 var SupportedExtensions = map[string]struct{}{
 	".mkv": {}, ".mp4": {}, ".avi": {}, ".mov": {}, ".ts": {}, ".m2ts": {}, ".iso": {},
@@ -74,7 +74,7 @@ func Scan(ctx context.Context, incomingPath string) ([]File, error) {
 		}
 		if info.Size() < MinFileSize {
 			file.ErrorCode = models.ErrFileTooSmall
-			file.ErrorMessage = fmt.Sprintf("文件大小 %d 小于 300MB", info.Size())
+			file.ErrorMessage = fmt.Sprintf("文件大小 %d，无有效内容", info.Size())
 			files = append(files, file)
 			return nil
 		}

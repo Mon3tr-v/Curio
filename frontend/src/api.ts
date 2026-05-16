@@ -1,7 +1,10 @@
 import type {
   Batch,
+  AuthLoginResult,
+  AuthStatus,
   ClassificationConfig,
   Collection,
+  CollectionPage,
   CloudDriveFile,
   CloudDriveSettings,
   CloudDriveStatus,
@@ -16,42 +19,86 @@ import type {
   P115QRCodeSession,
   P115QRCodeStatus,
   P115Settings,
+  P115SyncRun,
   P115Status,
+  RearchiveBatchResult,
   RearchivePayload,
   STRMSyncResult,
   SystemSettings,
   TVShow,
+  TVShowPage,
 } from './types';
 
-export const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8080';
+export const API_URL = import.meta.env.VITE_API_URL ?? '';
+export const AUTH_TOKEN_KEY = 'curio.adminToken';
+
+export class CurioAuthError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CurioAuthError';
+  }
+}
+
+export function getAuthToken() {
+  if (typeof window === 'undefined') return '';
+  return window.localStorage.getItem(AUTH_TOKEN_KEY) ?? '';
+}
+
+export function setAuthToken(token: string) {
+  if (typeof window === 'undefined') return;
+  const next = token.trim();
+  if (next) {
+    window.localStorage.setItem(AUTH_TOKEN_KEY, next);
+  } else {
+    window.localStorage.removeItem(AUTH_TOKEN_KEY);
+  }
+}
+
+export function isAuthError(error: unknown) {
+  return error instanceof CurioAuthError;
+}
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
-  });
+  const token = getAuthToken();
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { 'X-Curio-Token': token } : {}),
+        ...(init?.headers ?? {}),
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '网络请求失败';
+    throw new Error(`无法连接后端接口 ${path}：${message}`);
+  }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ error: response.statusText }));
+    if (response.status === 401) {
+      throw new CurioAuthError(payload.error ?? '需要 Curio 管理令牌');
+    }
     throw new Error(payload.error ?? response.statusText);
   }
   return response.json() as Promise<T>;
 }
 
-type MediaListParams = { query?: string; limit?: number; offset?: number };
+type MediaListParams = { query?: string; limit?: number; offset?: number; status?: string };
 
 function withMediaParams(path: string, params: MediaListParams = {}) {
   const query = new URLSearchParams();
   if (params.query?.trim()) query.set('q', params.query.trim());
   if (params.limit) query.set('limit', String(params.limit));
   if (params.offset) query.set('offset', String(params.offset));
+  if (params.status?.trim()) query.set('status', params.status.trim());
   const suffix = query.toString();
   return suffix ? `${path}?${suffix}` : path;
 }
 
 export const endpoints = {
+  authStatus: () => api<AuthStatus>('/api/auth/status'),
+  authLogin: (token: string) => api<AuthLoginResult>('/api/auth/login', { method: 'POST', body: JSON.stringify({ token }) }),
   health: () => api<Health>('/api/health'),
   batches: () => api<Batch[]>('/api/batches'),
   stats: () => api<MediaStats>('/api/stats'),
@@ -85,6 +132,7 @@ export const endpoints = {
   exportP115Tree: () => api<STRMSyncResult>('/api/p115/export-tree', { method: 'POST' }),
   syncP115STRM: () => api<STRMSyncResult>('/api/p115/strm/sync', { method: 'POST' }),
   cleanupP115STRM: () => api<STRMSyncResult>('/api/p115/strm/cleanup', { method: 'POST' }),
+  p115SyncRuns: () => api<P115SyncRun[]>('/api/p115/sync-runs?limit=20'),
   classification: () => api<ClassificationConfig>('/api/settings/classification'),
   saveClassification: (payload: unknown) =>
     api<ClassificationConfig>('/api/settings/classification', { method: 'PUT', body: JSON.stringify(payload) }),
@@ -102,12 +150,12 @@ export const endpoints = {
   rearchiveMediaFile: (id: string, payload: RearchivePayload) =>
     api<MediaFile>(`/api/media-files/${id}/rearchive`, { method: 'POST', body: JSON.stringify(payload) }),
   rearchiveMediaFiles: (ids: string[], payload: RearchivePayload) =>
-    api<{ items: MediaFile[]; count: number }>('/api/media-files/bulk-rearchive', {
+    api<RearchiveBatchResult>('/api/media-files/bulk-rearchive', {
       method: 'POST',
       body: JSON.stringify({ file_ids: ids, ...payload }),
     }),
-  tvShows: () => api<TVShow[]>('/api/tv-shows'),
+  tvShows: (params?: MediaListParams) => api<TVShowPage>(withMediaParams('/api/tv-shows', params)),
   tvShow: (id: number) => api<TVShow>(`/api/tv-shows/${id}`),
-  collections: () => api<Collection[]>('/api/collections'),
+  collections: (params?: MediaListParams) => api<CollectionPage>(withMediaParams('/api/collections', params)),
   collection: (id: number) => api<Collection>(`/api/collections/${id}`),
 };

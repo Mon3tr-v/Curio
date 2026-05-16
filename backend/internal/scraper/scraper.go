@@ -243,9 +243,15 @@ func (c *Client) searchMovies(ctx context.Context, titles []string, year int) (t
 					lastErr = err
 					continue
 				}
-				for _, item := range response.Results {
+				for index, item := range response.Results {
+					item.QueryMatches = appendTitle(item.QueryMatches, title)
+					item.BestRank = index + 1
 					if index, ok := seen[item.ID]; ok {
 						merged.Results[index].AltTitles = appendTitle(merged.Results[index].AltTitles, item.Title, item.OriginalTitle)
+						merged.Results[index].QueryMatches = appendTitle(merged.Results[index].QueryMatches, title)
+						if item.BestRank > 0 && (merged.Results[index].BestRank == 0 || item.BestRank < merged.Results[index].BestRank) {
+							merged.Results[index].BestRank = item.BestRank
+						}
 						continue
 					}
 					seen[item.ID] = len(merged.Results)
@@ -272,9 +278,15 @@ func (c *Client) searchTV(ctx context.Context, titles []string) (tmdbTVSearch, e
 				lastErr = err
 				continue
 			}
-			for _, item := range response.Results {
+			for index, item := range response.Results {
+				item.QueryMatches = appendTitle(item.QueryMatches, title)
+				item.BestRank = index + 1
 				if index, ok := seen[item.ID]; ok {
 					merged.Results[index].AltNames = appendTitle(merged.Results[index].AltNames, item.Name, item.OriginalName)
+					merged.Results[index].QueryMatches = appendTitle(merged.Results[index].QueryMatches, title)
+					if item.BestRank > 0 && (merged.Results[index].BestRank == 0 || item.BestRank < merged.Results[index].BestRank) {
+						merged.Results[index].BestRank = item.BestRank
+					}
 					continue
 				}
 				seen[item.ID] = len(merged.Results)
@@ -848,6 +860,9 @@ func bestTVCandidate(items []tmdbTVSearchItem, parsed parser.Result) (tmdbTVSear
 }
 
 func movieTieBreak(a, b tmdbMovieSearchItem) bool {
+	if a.BestRank > 0 && b.BestRank > 0 && a.BestRank != b.BestRank {
+		return a.BestRank < b.BestRank
+	}
 	if a.VoteCount != b.VoteCount {
 		return a.VoteCount > b.VoteCount
 	}
@@ -855,6 +870,9 @@ func movieTieBreak(a, b tmdbMovieSearchItem) bool {
 }
 
 func tvTieBreak(a, b tmdbTVSearchItem) bool {
+	if a.BestRank > 0 && b.BestRank > 0 && a.BestRank != b.BestRank {
+		return a.BestRank < b.BestRank
+	}
 	if a.VoteCount != b.VoteCount {
 		return a.VoteCount > b.VoteCount
 	}
@@ -863,6 +881,9 @@ func tvTieBreak(a, b tmdbTVSearchItem) bool {
 
 func movieScore(item tmdbMovieSearchItem, targets []string, year int) int {
 	score := titleScore(targets, item.Title, item.OriginalTitle, item.AltTitles)
+	if score == 0 && queryMatchScore(targets, item.QueryMatches) > 0 {
+		score = 70
+	}
 	if score == 0 {
 		return 0
 	}
@@ -872,6 +893,9 @@ func movieScore(item tmdbMovieSearchItem, targets []string, year int) int {
 
 func tvScore(item tmdbTVSearchItem, targets []string, year int) int {
 	match := titleMatchScore(targets, item.Name, item.OriginalName, item.AltNames)
+	if match.score == 0 && queryMatchScore(targets, item.QueryMatches) > 0 {
+		match.score = 70
+	}
 	if match.score == 0 {
 		return 0
 	}
@@ -927,6 +951,21 @@ func looseTitleContains(current, target string) bool {
 		return false
 	}
 	return strings.Contains(current, target) || strings.Contains(target, current)
+}
+
+func queryMatchScore(targets []string, queries []string) int {
+	for _, query := range queries {
+		normalized := matcher.NormalizeTitle(query)
+		if normalized == "" {
+			continue
+		}
+		for _, target := range targets {
+			if normalized == target {
+				return 70
+			}
+		}
+	}
+	return 0
 }
 
 func yearScore(target, candidate int) int {
@@ -1090,6 +1129,8 @@ type tmdbMovieSearchItem struct {
 	Popularity    float64 `json:"popularity"`
 	VoteCount     int     `json:"vote_count"`
 	AltTitles     []string
+	QueryMatches  []string
+	BestRank      int
 }
 
 type tmdbTVSearch struct {
@@ -1104,6 +1145,8 @@ type tmdbTVSearchItem struct {
 	Popularity   float64 `json:"popularity"`
 	VoteCount    int     `json:"vote_count"`
 	AltNames     []string
+	QueryMatches []string
+	BestRank     int
 }
 
 type tmdbMovieDetail struct {

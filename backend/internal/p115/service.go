@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ import (
 
 type Service struct {
 	store         *repository.Store
+	syncMu        sync.Mutex
 	cacheMu       sync.Mutex
 	directCache   map[string]cachedDirectURL
 	authMu        sync.Mutex
@@ -224,57 +226,73 @@ func (s *Service) ImportOpenToken(ctx context.Context, accessToken, refreshToken
 }
 
 func (s *Service) ExportTree(ctx context.Context) (models.STRMSyncResult, error) {
+	return s.runLogged(ctx, models.P115SyncTriggerManualExport, func(ctx context.Context) (models.STRMSyncResult, error) {
+		return s.exportTree(ctx)
+	})
+}
+
+func (s *Service) exportTree(ctx context.Context) (models.STRMSyncResult, error) {
 	settings, cfg, err := s.settingsAndLibraries(ctx)
 	if err != nil {
 		return models.STRMSyncResult{}, err
 	}
 	client := NewClient(settings)
-	result := models.STRMSyncResult{TreeVersion: treeVersion()}
+	result := models.STRMSyncResult{TreeVersion: treeVersion(), Mode: "refresh"}
 	for _, lib := range cfg.Libraries {
 		items, err := client.ExportTree(ctx, lib)
 		if err != nil {
 			result.Failed++
 			return result, err
 		}
-		result.Exported += len(items)
-		for _, item := range items {
-			if isMediaTreeItem(item) {
-				result.Skipped++
-			}
+		items, snapshot := prepareTreeItems(lib, items, result.TreeVersion)
+		if err := s.store.ReplaceP115Snapshot(ctx, lib.CID, result.TreeVersion, snapshot); err != nil {
+			return result, err
 		}
+		cursor := latestCursor(ctx, client, lib.CID, "refresh")
+		if err := s.store.ReplaceP115NodesAndCursor(ctx, lib.CID, result.TreeVersion, nodesFromTreeItems(lib, items, result.TreeVersion), cursor); err != nil {
+			return result, err
+		}
+		result.Exported += len(items)
+		result.Skipped += countMediaTreeItems(items)
 	}
 	return result, nil
 }
 
 func (s *Service) Sync(ctx context.Context, fallbackBaseURL string) (models.STRMSyncResult, error) {
+	return s.runLogged(ctx, models.P115SyncTriggerManualSync, func(ctx context.Context) (models.STRMSyncResult, error) {
+		return s.sync(ctx, fallbackBaseURL)
+	})
+}
+
+func (s *Service) SyncScheduled(ctx context.Context) (models.STRMSyncResult, error) {
+	return s.runLogged(ctx, models.P115SyncTriggerCron, func(ctx context.Context) (models.STRMSyncResult, error) {
+		return s.sync(ctx, "")
+	})
+}
+
+func (s *Service) sync(ctx context.Context, fallbackBaseURL string) (models.STRMSyncResult, error) {
 	settings, cfg, err := s.settingsAndLibraries(ctx)
 	if err != nil {
 		return models.STRMSyncResult{}, err
 	}
 	client := NewClient(settings)
-	result := models.STRMSyncResult{TreeVersion: treeVersion()}
+	result := models.STRMSyncResult{TreeVersion: treeVersion(), Mode: "sync"}
 	for _, lib := range cfg.Libraries {
-		items, err := client.ExportTree(ctx, lib)
+		items, version, sourceMode, err := s.treeItemsForSync(ctx, client, lib, result.TreeVersion)
 		if err != nil {
 			result.Failed++
 			return result, err
 		}
+		if version != "" {
+			result.TreeVersion = version
+		}
+		if result.Mode == "sync" && sourceMode != "" {
+			result.Mode = sourceMode
+		}
 		result.Exported += len(items)
-		snapshot := make([]models.P115TreeSnapshotItem, 0, len(items))
 		seen := map[string]struct{}{}
 		for _, item := range items {
-			item.SourceTreeHash = sourceHash(lib.CID, item.RelativePath, item.RemoteFileID, item.PickCode, item.SHA1, item.Size)
 			media := isMediaTreeItem(item)
-			snapshot = append(snapshot, models.P115TreeSnapshotItem{
-				LibraryCID:     lib.CID,
-				TreeVersion:    result.TreeVersion,
-				RelativePath:   item.RelativePath,
-				Name:           item.Name,
-				Extension:      strings.TrimPrefix(strings.ToLower(path.Ext(item.Name)), "."),
-				Depth:          item.Depth,
-				IsMedia:        media,
-				SourceTreeHash: item.SourceTreeHash,
-			})
 			if !media {
 				continue
 			}
@@ -336,8 +354,11 @@ func (s *Service) Sync(ctx context.Context, fallbackBaseURL string) (models.STRM
 			}
 			result.Deleted++
 		}
-		if err := s.store.ReplaceP115Snapshot(ctx, lib.CID, result.TreeVersion, snapshot); err != nil {
-			return result, err
+		if sourceMode == "scan" || sourceMode == "events" {
+			_, snapshot := prepareTreeItems(lib, items, result.TreeVersion)
+			if err := s.store.ReplaceP115Snapshot(ctx, lib.CID, result.TreeVersion, snapshot); err != nil {
+				return result, err
+			}
 		}
 	}
 	if settings.RefreshEmbyAfterSync {
@@ -347,6 +368,12 @@ func (s *Service) Sync(ctx context.Context, fallbackBaseURL string) (models.STRM
 }
 
 func (s *Service) Cleanup(ctx context.Context) (models.STRMSyncResult, error) {
+	return s.runLogged(ctx, models.P115SyncTriggerManualCleanup, func(ctx context.Context) (models.STRMSyncResult, error) {
+		return s.cleanup(ctx)
+	})
+}
+
+func (s *Service) cleanup(ctx context.Context) (models.STRMSyncResult, error) {
 	settings, err := s.store.P115Settings(ctx)
 	if err != nil {
 		return models.STRMSyncResult{}, err
@@ -355,7 +382,7 @@ func (s *Service) Cleanup(ctx context.Context) (models.STRMSyncResult, error) {
 	if err != nil {
 		return models.STRMSyncResult{}, err
 	}
-	result := models.STRMSyncResult{TreeVersion: treeVersion()}
+	result := models.STRMSyncResult{TreeVersion: treeVersion(), Mode: "cleanup"}
 	for _, link := range links {
 		if removeManagedSTRM(settings.STRMOutputPath, link.STRMPath) == nil {
 			result.Deleted++
@@ -365,6 +392,99 @@ func (s *Service) Cleanup(ctx context.Context) (models.STRMSyncResult, error) {
 		_ = s.store.MarkSTRMLinkStatus(ctx, link.ID, models.STRMStatusDeleted, models.STRMResolveStale, "", "")
 	}
 	return result, nil
+}
+
+func (s *Service) SyncRuns(ctx context.Context, limit int) ([]models.P115SyncRun, error) {
+	return s.store.P115SyncRuns(ctx, limit)
+}
+
+func (s *Service) StartScheduler(ctx context.Context) {
+	go s.scheduler(ctx)
+}
+
+func (s *Service) scheduler(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.runScheduledIfDue(ctx)
+		}
+	}
+}
+
+func (s *Service) runScheduledIfDue(ctx context.Context) {
+	settings, err := s.store.P115Settings(ctx)
+	if err != nil || !settings.SyncCronEnabled {
+		return
+	}
+	interval := time.Duration(settings.SyncIntervalMinutes) * time.Minute
+	if interval < 5*time.Minute {
+		interval = 5 * time.Minute
+	}
+	last, ok, err := s.store.LatestP115SyncRun(ctx, []string{models.P115SyncTriggerManualSync, models.P115SyncTriggerCron})
+	if err != nil {
+		return
+	}
+	if ok && time.Since(last.StartedAt) < interval {
+		return
+	}
+	runCtx, cancel := context.WithTimeout(ctx, 60*time.Minute)
+	defer cancel()
+	_, _ = s.SyncScheduled(runCtx)
+}
+
+func (s *Service) runLogged(ctx context.Context, trigger string, fn func(context.Context) (models.STRMSyncResult, error)) (models.STRMSyncResult, error) {
+	if !s.syncMu.TryLock() {
+		return models.STRMSyncResult{}, errors.New("115 同步正在运行，请稍后再试")
+	}
+	defer s.syncMu.Unlock()
+
+	id, err := randomToken(12)
+	if err != nil {
+		return models.STRMSyncResult{}, err
+	}
+	started := time.Now()
+	run := models.P115SyncRun{
+		ID:        trigger + "_" + id,
+		Trigger:   trigger,
+		Status:    models.P115SyncStatusRunning,
+		StartedAt: started,
+	}
+	if err := s.store.CreateP115SyncRun(ctx, run); err != nil {
+		return models.STRMSyncResult{}, err
+	}
+
+	result, runErr := fn(ctx)
+	ended := time.Now()
+	run.Mode = result.Mode
+	run.TreeVersion = result.TreeVersion
+	run.Exported = result.Exported
+	run.Generated = result.Generated
+	run.Restored = result.Restored
+	run.Updated = result.Updated
+	run.Deleted = result.Deleted
+	run.Skipped = result.Skipped
+	run.Failed = result.Failed
+	run.EndedAt = &ended
+	run.DurationMS = ended.Sub(started).Milliseconds()
+	switch {
+	case runErr != nil:
+		run.Status = models.P115SyncStatusFailed
+		run.ErrorMessage = runErr.Error()
+	case result.Failed > 0:
+		run.Status = models.P115SyncStatusPartial
+	default:
+		run.Status = models.P115SyncStatusSuccess
+	}
+	finishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.store.FinishP115SyncRun(finishCtx, run); err != nil && runErr == nil {
+		return result, err
+	}
+	return result, runErr
 }
 
 func (s *Service) PlayURLForLink(linkID, baseURL string) (string, error) {
@@ -629,6 +749,460 @@ func (s *Service) linkForItem(settings models.P115Settings, fallbackBaseURL stri
 		ResolvedAt:     resolvedAt,
 		UpdatedAt:      now,
 	}, nil
+}
+
+func (s *Service) treeItemsForSync(ctx context.Context, client *Client, lib LibraryConfig, version string) ([]TreeItem, string, string, error) {
+	nodeCount, err := s.store.P115NodeCount(ctx, lib.CID)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if nodeCount > 0 {
+		nodes, nodeVersion, err := s.nodesWithLifeEvents(ctx, client, lib, version)
+		if err == nil {
+			if nodeVersion != "" {
+				version = nodeVersion
+			}
+			return treeItemsFromNodes(nodes), version, "events", nil
+		}
+	}
+	items, scanErr := client.ExportTree(ctx, lib)
+	if scanErr == nil {
+		items, _ = prepareTreeItems(lib, items, version)
+		nodes := nodesFromTreeItems(lib, items, version)
+		if err := s.store.ReplaceP115NodesAndCursor(ctx, lib.CID, version, nodes, latestCursor(ctx, client, lib.CID, "scan")); err != nil {
+			return nil, "", "", err
+		}
+		return items, version, "scan", nil
+	}
+	if nodeCount > 0 {
+		nodes, nodeVersion, err := s.store.P115Nodes(ctx, lib.CID, true)
+		if err != nil {
+			return nil, "", "", err
+		}
+		if nodeVersion != "" {
+			version = nodeVersion
+		}
+		return treeItemsFromNodes(nodes), version, "cache", nil
+	}
+	snapshot, snapshotVersion, err := s.store.P115Snapshot(ctx, lib.CID)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if len(snapshot) > 0 {
+		return treeItemsFromSnapshot(snapshot), snapshotVersion, "snapshot", nil
+	}
+	return nil, "", "", scanErr
+}
+
+func (s *Service) nodesWithLifeEvents(ctx context.Context, client *Client, lib LibraryConfig, version string) ([]models.P115Node, string, error) {
+	nodes, nodeVersion, err := s.store.P115Nodes(ctx, lib.CID, false)
+	if err != nil {
+		return nil, "", err
+	}
+	cursor, err := s.store.P115EventCursor(ctx, lib.CID)
+	if err != nil {
+		return nil, "", err
+	}
+	if cursor.LastEventID == 0 && cursor.LastEventTime == 0 {
+		cursor = latestCursor(ctx, client, lib.CID, "init")
+		if cursor.LastSyncStatus == "error" {
+			if err := s.store.SaveP115EventCursor(ctx, cursor); err != nil {
+				return nil, "", err
+			}
+			return nil, "", errors.New(cursor.LastSyncError)
+		}
+		if err := s.store.SaveP115EventCursor(ctx, cursor); err != nil {
+			return nil, "", err
+		}
+		return aliveNodes(nodes), nodeVersion, nil
+	}
+	batch, err := client.LifeEventsBatch(ctx, cursor.LastEventID, cursor.LastEventTime, 20)
+	if err != nil {
+		saveErr := s.store.SaveP115EventCursor(ctx, models.P115EventCursor{
+			LibraryCID:     lib.CID,
+			LastEventID:    cursor.LastEventID,
+			LastEventTime:  cursor.LastEventTime,
+			LastSyncStatus: "error",
+			LastSyncError:  err.Error(),
+		})
+		if saveErr != nil {
+			return nil, "", saveErr
+		}
+		return nil, "", err
+	}
+	events := batch.Events
+	nextCursor := advanceCursorWithBatch(cursor, batch)
+	nextCursor.LibraryCID = lib.CID
+	nextCursor.LastSyncStatus = "ok"
+	nextCursor.LastSyncError = ""
+	if len(events) == 0 {
+		if err := s.store.SaveP115EventCursor(ctx, nextCursor); err != nil {
+			return nil, "", err
+		}
+		return aliveNodes(nodes), nodeVersion, nil
+	}
+	sort.SliceStable(events, func(i, j int) bool {
+		left, right := eventApplyPriority(events[i]), eventApplyPriority(events[j])
+		if left != right {
+			return left < right
+		}
+		return events[i].ID < events[j].ID
+	})
+	nextVersion := version
+	if nextVersion == "" {
+		nextVersion = treeVersion()
+	}
+	updated, changed := applyLifeEventsToNodes(lib, nodes, events, nextVersion)
+	if changed {
+		if err := s.store.ReplaceP115NodesAndCursor(ctx, lib.CID, nextVersion, updated, nextCursor); err != nil {
+			return nil, "", err
+		}
+		return aliveNodes(updated), nextVersion, nil
+	}
+	if err := s.store.SaveP115EventCursor(ctx, nextCursor); err != nil {
+		return nil, "", err
+	}
+	return aliveNodes(updated), nodeVersion, nil
+}
+
+func latestCursor(ctx context.Context, client *Client, libraryCID, status string) models.P115EventCursor {
+	id, eventTime, err := client.LatestLifeEventCursor(ctx)
+	cursor := models.P115EventCursor{
+		LibraryCID:     libraryCID,
+		LastEventID:    id,
+		LastEventTime:  eventTime,
+		LastSyncStatus: status,
+	}
+	if err != nil {
+		cursor.LastSyncStatus = "error"
+		cursor.LastSyncError = err.Error()
+	}
+	return cursor
+}
+
+func eventsNeedTreeScan(events []LifeEvent) bool {
+	return false
+}
+
+func eventApplyPriority(event LifeEvent) int {
+	if eventCreatesDirectory(event) {
+		return 0
+	}
+	return 1
+}
+
+func eventCreatesDirectory(event LifeEvent) bool {
+	switch event.Type {
+	case 17, 18, 20:
+		return true
+	case 5, 6:
+		if strings.TrimSpace(event.PickCode) != "" || strings.TrimSpace(event.SHA1) != "" || event.Size > 0 {
+			return false
+		}
+		name := strings.TrimSpace(event.Name)
+		return name == "" || !mediaExtension(path.Ext(name))
+	default:
+		return false
+	}
+}
+
+func advanceCursor(cursor models.P115EventCursor, events []LifeEvent) models.P115EventCursor {
+	for _, event := range events {
+		if event.ID > cursor.LastEventID {
+			cursor.LastEventID = event.ID
+		}
+		if event.UpdateTime > cursor.LastEventTime {
+			cursor.LastEventTime = event.UpdateTime
+		}
+	}
+	return cursor
+}
+
+func advanceCursorWithBatch(cursor models.P115EventCursor, batch LifeEventBatch) models.P115EventCursor {
+	if batch.LastEventID > cursor.LastEventID {
+		cursor.LastEventID = batch.LastEventID
+	}
+	if batch.LastEventTime > cursor.LastEventTime {
+		cursor.LastEventTime = batch.LastEventTime
+	}
+	if batch.LastEventID == 0 && batch.LastEventTime == 0 {
+		return advanceCursor(cursor, batch.Events)
+	}
+	return cursor
+}
+
+func applyLifeEventsToNodes(lib LibraryConfig, nodes []models.P115Node, events []LifeEvent, version string) ([]models.P115Node, bool) {
+	byID := make(map[string]*models.P115Node, len(nodes)+len(events))
+	out := make([]models.P115Node, 0, len(nodes)+len(events))
+	for _, node := range nodes {
+		if strings.TrimSpace(node.RemoteFileID) == "" {
+			continue
+		}
+		node.LibraryCID = lib.CID
+		out = append(out, node)
+		byID[node.RemoteFileID] = &out[len(out)-1]
+	}
+	changed := false
+	for _, event := range events {
+		if event.FileID == "" {
+			continue
+		}
+		node, exists := byID[event.FileID]
+		if event.Type == 22 {
+			if exists && node.IsAlive {
+				node.IsAlive = false
+				node.TreeVersion = version
+				changed = true
+			}
+			continue
+		}
+		parentInside := event.ParentID == lib.CID
+		if !parentInside {
+			if parent, ok := byID[event.ParentID]; ok && parent.IsAlive {
+				parentInside = true
+			}
+		}
+		if exists && !parentInside {
+			if node.IsAlive {
+				node.IsAlive = false
+				node.TreeVersion = version
+				changed = true
+			}
+			continue
+		}
+		if !parentInside {
+			continue
+		}
+		name := strings.TrimSpace(event.Name)
+		if name == "" && exists {
+			name = node.Name
+		}
+		if name == "" {
+			continue
+		}
+		if !exists {
+			newNode := models.P115Node{LibraryCID: lib.CID, RemoteFileID: event.FileID}
+			out = append(out, newNode)
+			node = &out[len(out)-1]
+			byID[event.FileID] = node
+		}
+		node.LibraryCID = lib.CID
+		node.TreeVersion = version
+		node.ParentFileID = event.ParentID
+		node.Name = name
+		node.IsAlive = true
+		node.IsDirectory = eventIsDirectory(event, *node)
+		if event.PickCode != "" {
+			node.PickCode = event.PickCode
+		}
+		if event.SHA1 != "" || node.IsDirectory {
+			node.SHA1 = event.SHA1
+		}
+		if event.Size > 0 || node.IsDirectory {
+			node.Size = event.Size
+		}
+		changed = true
+	}
+	if rebuildNodePaths(lib, out, version) {
+		changed = true
+	}
+	return out, changed
+}
+
+func eventIsDirectory(event LifeEvent, existing models.P115Node) bool {
+	if eventCreatesDirectory(event) {
+		return true
+	}
+	if event.SHA1 != "" || event.Size > 0 {
+		return false
+	}
+	return existing.IsDirectory
+}
+
+func rebuildNodePaths(lib LibraryConfig, nodes []models.P115Node, version string) bool {
+	byID := make(map[string]*models.P115Node, len(nodes))
+	for i := range nodes {
+		byID[nodes[i].RemoteFileID] = &nodes[i]
+	}
+	state := map[string]bool{}
+	visiting := map[string]bool{}
+	var changed bool
+	var compute func(string) (string, bool)
+	compute = func(id string) (string, bool) {
+		node, ok := byID[id]
+		if !ok || !node.IsAlive {
+			return "", false
+		}
+		if alive, ok := state[id]; ok {
+			return node.RelativePath, alive
+		}
+		if visiting[id] {
+			node.IsAlive = false
+			changed = true
+			state[id] = false
+			return "", false
+		}
+		visiting[id] = true
+		defer delete(visiting, id)
+		var rel string
+		if node.ParentFileID == "" || node.ParentFileID == lib.CID {
+			rel = node.Name
+		} else {
+			parentRel, alive := compute(node.ParentFileID)
+			if !alive {
+				node.IsAlive = false
+				node.TreeVersion = version
+				changed = true
+				state[id] = false
+				return "", false
+			}
+			rel = path.Join(parentRel, node.Name)
+		}
+		if node.RelativePath != rel {
+			node.RelativePath = rel
+			changed = true
+		}
+		node.IsMedia = mediaExtension(path.Ext(node.Name)) && !node.IsDirectory
+		hash := sourceHash(lib.CID, node.RelativePath, node.RemoteFileID, node.PickCode, node.SHA1, node.Size)
+		if node.SourceTreeHash != hash {
+			node.SourceTreeHash = hash
+			changed = true
+		}
+		if version != "" && node.TreeVersion != version {
+			node.TreeVersion = version
+			changed = true
+		}
+		state[id] = node.IsAlive
+		return node.RelativePath, node.IsAlive
+	}
+	for i := range nodes {
+		compute(nodes[i].RemoteFileID)
+	}
+	return changed
+}
+
+func nodesFromTreeItems(lib LibraryConfig, items []TreeItem, version string) []models.P115Node {
+	nodes := make([]models.P115Node, 0, len(items))
+	for _, item := range items {
+		if item.RemoteFileID == "" {
+			continue
+		}
+		nodes = append(nodes, models.P115Node{
+			LibraryCID:     lib.CID,
+			TreeVersion:    version,
+			RemoteFileID:   item.RemoteFileID,
+			ParentFileID:   item.ParentFileID,
+			RelativePath:   item.RelativePath,
+			Name:           item.Name,
+			PickCode:       item.PickCode,
+			SHA1:           item.SHA1,
+			Size:           item.Size,
+			IsDirectory:    item.IsDirectory,
+			IsMedia:        isMediaTreeItem(item),
+			IsAlive:        true,
+			SourceTreeHash: item.SourceTreeHash,
+		})
+	}
+	return nodes
+}
+
+func aliveNodes(nodes []models.P115Node) []models.P115Node {
+	out := make([]models.P115Node, 0, len(nodes))
+	for _, node := range nodes {
+		if node.IsAlive {
+			out = append(out, node)
+		}
+	}
+	return out
+}
+
+func treeItemsFromNodes(nodes []models.P115Node) []TreeItem {
+	items := make([]TreeItem, 0, len(nodes))
+	for _, node := range nodes {
+		if !node.IsAlive {
+			continue
+		}
+		items = append(items, TreeItem{
+			RelativePath:   node.RelativePath,
+			Name:           node.Name,
+			RemoteFileID:   node.RemoteFileID,
+			ParentFileID:   node.ParentFileID,
+			PickCode:       node.PickCode,
+			SHA1:           node.SHA1,
+			Size:           node.Size,
+			Depth:          pathDepth(node.RelativePath),
+			IsDirectory:    node.IsDirectory,
+			SourceTreeHash: node.SourceTreeHash,
+		})
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].RelativePath < items[j].RelativePath })
+	return items
+}
+
+func pathDepth(value string) int {
+	value = strings.Trim(value, "/")
+	if value == "" {
+		return 0
+	}
+	return strings.Count(value, "/") + 1
+}
+
+func prepareTreeItems(lib LibraryConfig, items []TreeItem, version string) ([]TreeItem, []models.P115TreeSnapshotItem) {
+	prepared := make([]TreeItem, 0, len(items))
+	snapshot := make([]models.P115TreeSnapshotItem, 0, len(items))
+	for _, item := range items {
+		item.SourceTreeHash = sourceHash(lib.CID, item.RelativePath, item.RemoteFileID, item.PickCode, item.SHA1, item.Size)
+		media := isMediaTreeItem(item)
+		extension := strings.TrimPrefix(strings.ToLower(path.Ext(item.Name)), ".")
+		prepared = append(prepared, item)
+		snapshot = append(snapshot, models.P115TreeSnapshotItem{
+			LibraryCID:     lib.CID,
+			TreeVersion:    version,
+			RelativePath:   item.RelativePath,
+			Name:           item.Name,
+			RemoteFileID:   item.RemoteFileID,
+			ParentFileID:   item.ParentFileID,
+			PickCode:       item.PickCode,
+			SHA1:           item.SHA1,
+			Size:           item.Size,
+			Extension:      extension,
+			Depth:          item.Depth,
+			IsDirectory:    item.IsDirectory,
+			IsMedia:        media,
+			SourceTreeHash: item.SourceTreeHash,
+		})
+	}
+	return prepared, snapshot
+}
+
+func treeItemsFromSnapshot(snapshot []models.P115TreeSnapshotItem) []TreeItem {
+	items := make([]TreeItem, 0, len(snapshot))
+	for _, item := range snapshot {
+		isDirectory := item.IsDirectory || (!item.IsMedia && item.Extension == "")
+		items = append(items, TreeItem{
+			RelativePath:   item.RelativePath,
+			Name:           item.Name,
+			RemoteFileID:   item.RemoteFileID,
+			ParentFileID:   item.ParentFileID,
+			PickCode:       item.PickCode,
+			SHA1:           item.SHA1,
+			Size:           item.Size,
+			Depth:          item.Depth,
+			IsDirectory:    isDirectory,
+			SourceTreeHash: item.SourceTreeHash,
+		})
+	}
+	return items
+}
+
+func countMediaTreeItems(items []TreeItem) int {
+	count := 0
+	for _, item := range items {
+		if isMediaTreeItem(item) {
+			count++
+		}
+	}
+	return count
 }
 
 func playBaseURL(settings models.P115Settings, fallbackBaseURL string) string {

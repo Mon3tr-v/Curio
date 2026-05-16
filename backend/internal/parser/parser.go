@@ -54,6 +54,7 @@ var (
 	miniseriesPartRE   = regexp.MustCompile(`(?i)^(.*?)[ ._-]*Mini[ ._-]?series[ ._-]*Part[ ._-]*(\d{1,2})(?:$|[ ._\-\]\)])`)
 	doctorWhoSpecialRE = regexp.MustCompile(`(?i)^Doctor[ ._-]Who[ ._-]2005[ ._-]Christmas[ ._-]Special.*Twice[ ._-]Upon[ ._-]A[ ._-]Time`)
 	haloForwardRE      = regexp.MustCompile(`(?i)^Halo[ ._-]*4[ ._-]*Forward[ ._-]*Unto[ ._-]*Dawn`)
+	animeSeasonTitleRE = regexp.MustCompile(`(?i)^(.{3,}?)(?:[ ._-]*(?:s|season)[ ._-]*)?([2-9])$`)
 	singleSeasonRE     = regexp.MustCompile(`(?i)S(?:eason)?[ ._-]*(\d{1,2})(?:$|[ ._\-\]\)])`)
 	chineseSeasonRE    = regexp.MustCompile(`第\s*(\d{1,2})\s*[季部]`)
 	seasonRE           = regexp.MustCompile(`(?i)(?:^|[ ._\-\[\(])S(?:eason)?[ ._-]*(\d{1,2})(?:$|[ ._\-\]\)])|第\s*(\d{1,2})\s*[季部]`)
@@ -71,7 +72,7 @@ var (
 	catalogBracketRE   = regexp.MustCompile(`^\s*(?:\d{1,4}|[A-Z])\[`)
 	numberedCatalogRE  = regexp.MustCompile(`^\s*\d{1,4}[.)、．]\s*`)
 	releaseSuffixRE    = regexp.MustCompile(`(?i)[ ._\-]+(FGT|FRDS|SGNB|CHDBits|RARBG|YIFY|YTS(?:\.[A-Z]+)?|WiKi|OurBits|MTeam|CMCT|MNHD|PTer|HDSky|HDHome|BHDStudio|HDChina|ADE|CtrlHD|DON|FraMeSToR|TERMiNAL|NTb|FLUX|HONE|MeGusta|ION10|ETHEL|Tigole|QxR|Vyndros|Judas|EMBER|ASW|SubsPlease|Erai[ ._-]?raws|Lilith[ ._-]?Raws|NC[ ._-]?Raws|LoliHouse|ANi)$`)
-	releaseGroupTagRE  = regexp.MustCompile(`(?i)^(ANi|SubsPlease|Erai[ ._-]?raws|Lilith[ ._-]?Raws|NC[ ._-]?Raws|Ohys[ ._-]?Raws|Skymoon[ ._-]?Raws|Leopard[ ._-]?Raws|LoliHouse|Nekomoe|Moozzi2|ReinForce|UCCUSS|Beatrice[ ._-]?Raws|SweetSub|Sakurato|Airota|SumiSora|GM[ ._-]?Team|HYSUB|KTXP|Kamigami|DMG|CASO|DHR|XKsub|MCE|VARYG|喵萌奶茶屋|桜都字幕组)(?:\b|[ &+_-])`)
+	releaseGroupTagRE  = regexp.MustCompile(`(?i)^(ANi|SubsPlease|Erai[ ._-]?raws|Lilith[ ._-]?Raws|NC[ ._-]?Raws|Ohys[ ._-]?Raws|Skymoon[ ._-]?Raws|Leopard[ ._-]?Raws|LoliHouse|Nekomoe|Moozzi2|ReinForce|UCCUSS|Beatrice[ ._-]?Raws|SweetSub|Sakurato|Airota|SumiSora|GM[ ._-]?Team|HYSUB|KTXP|Kamigami|DMG|CASO|DHR|XKsub|MCE|VARYG|VCB[ ._-]?Studio|T[ ._-]?H[ ._-]?X|喵萌奶茶屋|桜都字幕组)(?:\b|[ &+_-])`)
 	bracketNoiseWordRE = regexp.MustCompile(`(?i)(SGNB|CHDBits|UHD|BDJ|DIY|菜单|字幕|音轨|国语|国配|简繁|特效|收藏|未完待续|原盘|修复|新增按钮)`)
 	shortTagRE         = regexp.MustCompile(`(?i)^(Baha|B-Global|CR|AMZN|NF|Bilibili|CHS|CHT|GB|BIG5|AVC|AAC|HEVC|ASS|MP4|MKV|WEB|WEB-DL|TV|繁中|简中)$`)
 	hashTagRE          = regexp.MustCompile(`(?i)^[a-f0-9]{6,16}$`)
@@ -119,7 +120,7 @@ func parseTV(base, parentTitle string, parts []string, result Result) (Result, b
 		}
 		season := atoi(firstMatch(base, match, 2, 3))
 		episode := atoi(firstMatch(base, match, 4, 5))
-		return tvResult(base[:match[0]], parentTitle, result, season, episode)
+		return tvResult(base[:match[0]], parentTitle, result, season, episode, false)
 	}
 	for _, re := range episodeOnlyREs {
 		match := re.FindStringSubmatchIndex(base)
@@ -131,37 +132,52 @@ func parseTV(base, parentTitle string, parts []string, result Result) (Result, b
 			season = 1
 		}
 		episode := atoi(firstMatch(base, match, 2, 3))
-		return tvResult(base[:match[0]], parentTitle, result, season, episode)
+		return tvResult(base[:match[0]], parentTitle, result, season, episode, seasonFromParts(parts) == 0)
 	}
 	if match := bareEpisodeRE.FindStringSubmatch(base); len(match) > 1 {
 		if season := seasonFromParts(parts); season > 0 {
-			return tvResult("", parentTitle, result, season, atoi(match[1]))
+			return tvResult("", parentTitle, result, season, atoi(match[1]), false)
 		}
 	}
 	if match := seasonAsEpisodeRE.FindStringSubmatchIndex(base); match != nil {
 		if season := seasonFromParts(parts); season > 0 {
-			return tvResult(base[:match[0]], parentTitle, result, season, atoi(firstMatch(base, match, 2, 3)))
+			return tvResult(base[:match[0]], parentTitle, result, season, atoi(firstMatch(base, match, 2, 3)), false)
 		}
 	}
 	if match := miniseriesPartRE.FindStringSubmatch(base); len(match) > 2 {
-		return tvResult(match[1], parentTitle, result, 1, atoi(match[2]))
+		return tvResult(match[1], parentTitle, result, 1, atoi(match[2]), false)
 	}
 	if doctorWhoSpecialRE.MatchString(base) {
-		return tvResult("Doctor Who", parentTitle, result, 0, 0)
+		return tvResult("Doctor Who", parentTitle, result, 0, 0, false)
 	}
 	if haloForwardRE.MatchString(base) {
-		return tvResult("Halo 4 Forward Unto Dawn", parentTitle, result, 1, 1)
+		return tvResult("Halo 4 Forward Unto Dawn", parentTitle, result, 1, 1, false)
 	}
 	return result, false, nil
 }
 
-func tvResult(rawTitle, parentTitle string, result Result, season, episode int) (Result, bool, error) {
+func tvResult(rawTitle, parentTitle string, result Result, season, episode int, inferSeasonFromTitle bool) (Result, bool, error) {
+	originalRawTitle := rawTitle
+	if inferSeasonFromTitle {
+		if title, inferredSeason := splitAnimeSeasonTitle(rawTitle); title != "" && inferredSeason > 0 {
+			rawTitle = title
+			season = inferredSeason
+		}
+	}
 	title := cleanTitle(rawTitle)
+	rawCandidates := titleCandidates(rawTitle, originalRawTitle)
+	if preferred := preferredTVTitleCandidate(title, rawCandidates); preferred != "" {
+		title = preferred
+	}
+	parentCandidates := seriesTitleCandidates(parentTitle)
+	usedParentTitle := false
 	if weakTitle(title) {
-		title = firstString(seriesTitleCandidates(parentTitle)...)
+		title = firstString(parentCandidates...)
+		usedParentTitle = title != ""
 	}
 	if weakTitle(title) {
 		title = cleanName(parentTitle)
+		usedParentTitle = title != ""
 	}
 	if title == "" {
 		return result, true, ParseError{Code: models.ErrParseTitleEmpty, Message: "剧集标题为空"}
@@ -173,7 +189,10 @@ func tvResult(rawTitle, parentTitle string, result Result, season, episode int) 
 	result.Episode = episode
 	result.Season2 = two(season)
 	result.Episode2 = two(episode)
-	searchTitles := append(titleCandidates(rawTitle), seriesTitleCandidates(parentTitle)...)
+	searchTitles := rawCandidates
+	if usedParentTitle || len(searchTitles) == 0 {
+		searchTitles = append(searchTitles, parentCandidates...)
+	}
 	result.SearchTitles = uniqueNonEmpty(append([]string{title}, searchTitles...)...)
 	return result, true, nil
 }
@@ -232,11 +251,24 @@ func titleFromParents(parts []string) string {
 	if len(parts) < 2 {
 		return ""
 	}
-	parent := parts[len(parts)-2]
-	if isSeasonContainer(parent) && len(parts) >= 3 {
-		return parts[len(parts)-3]
+	parentIndex := len(parts) - 2
+	if isSeasonContainer(parts[parentIndex]) {
+		if parent := firstTitleParent(parts, parentIndex-1); parent != "" {
+			return parent
+		}
 	}
-	return parent
+	return firstTitleParent(parts, parentIndex)
+}
+
+func firstTitleParent(parts []string, start int) string {
+	for i := start; i >= 0; i-- {
+		part := strings.TrimSpace(parts[i])
+		if part == "" || isNonTitlePathPart(part) || isSeasonDir(part) {
+			continue
+		}
+		return part
+	}
+	return ""
 }
 
 func isSeasonDir(value string) bool {
@@ -347,6 +379,51 @@ func seasonFromSingleSeasonText(value string) int {
 		return atoi(match[1])
 	}
 	return 0
+}
+
+func splitAnimeSeasonTitle(value string) (string, int) {
+	cleaned := normalizeTitleForSeasonSuffix(value)
+	match := animeSeasonTitleRE.FindStringSubmatch(cleaned)
+	if len(match) < 3 || !hasEnoughTitleLetters(match[1]) {
+		return "", 0
+	}
+	title := cleanTitle(match[1])
+	if weakTitle(title) {
+		return "", 0
+	}
+	return title, atoi(match[2])
+}
+
+func normalizeTitleForSeasonSuffix(value string) string {
+	value = normalizeReleaseName(value)
+	value = removeBracketNoise(value)
+	value = noiseRE.ReplaceAllString(value, " ")
+	value = strings.NewReplacer("／", " ", "/", " ", "｜", " ", "|", " ", ".", " ", "_", " ", "-", " ").Replace(value)
+	value = spaceRE.ReplaceAllString(value, " ")
+	return strings.TrimSpace(value)
+}
+
+func hasEnoughTitleLetters(value string) bool {
+	count := 0
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '\u4e00' && r <= '\u9fff') || (r >= '\u3400' && r <= '\u4dbf') {
+			count++
+		}
+	}
+	return count >= 4
+}
+
+func isNonTitlePathPart(value string) bool {
+	normalized := strings.ToLower(cleanTitle(value))
+	switch normalized {
+	case "", "cd2", "115open", "115", "curio", "data", "media", "library",
+		"incoming", "staging", "failed", "fail", "failure", "incomplete collections",
+		"movies", "movie", "tv", "series", "shows", "collections", "collection",
+		"subs", "sub", "subtitle", "subtitles":
+		return true
+	default:
+		return false
+	}
 }
 
 func firstMatch(value string, match []int, startIdx, endIdx int) string {
@@ -515,10 +592,16 @@ func localizedTitleCandidates(value string) []string {
 
 func appendAliasCandidates(result []string, value string) []string {
 	value = regionNoteRE.ReplaceAllString(value, " ")
+	if title := broadcastTitleCandidate(value); title != "" {
+		result = append(result, title)
+	}
 	for _, part := range strings.FieldsFunc(value, func(r rune) bool {
 		return r == '/' || r == '／' || r == '|' || r == '｜' || r == '、'
 	}) {
 		if title := cleanTitle(part); title != "" {
+			if title := broadcastTitleCandidate(title); title != "" {
+				result = append(result, title)
+			}
 			result = append(result, title)
 		}
 	}
@@ -607,6 +690,72 @@ func titleVariants(title string) []string {
 		variants = append(variants, "Marvel's Agents of S.H.I.E.L.D.")
 	}
 	return variants
+}
+
+func preferredTVTitleCandidate(current string, candidates []string) string {
+	for _, candidate := range candidates {
+		if candidate == "" || weakTitle(candidate) || !containsHan(candidate) {
+			continue
+		}
+		if current == "" || !containsHan(current) || cleanerTitle(candidate, current) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func cleanerTitle(candidate, current string) bool {
+	candidate = strings.TrimSpace(candidate)
+	current = strings.TrimSpace(current)
+	if candidate == "" || current == "" || candidate == current {
+		return false
+	}
+	if strings.Contains(current, candidate) {
+		return true
+	}
+	candidateLen := runeLen(candidate)
+	currentLen := runeLen(current)
+	return candidateLen >= 2 && candidateLen+4 < currentLen
+}
+
+func broadcastTitleCandidate(value string) string {
+	cleaned := cleanTitle(value)
+	if cleaned == "" || !containsHan(cleaned) {
+		return ""
+	}
+	for _, marker := range []string{
+		"重温经典频道",
+		"少儿频道",
+		"动漫频道",
+		"动画频道",
+		"电视剧频道",
+		"电影频道",
+		"综合频道",
+		"高清频道",
+		"纪录频道",
+		"卫视频道",
+		"频道",
+		"电视台",
+		"卫视",
+	} {
+		index := strings.Index(cleaned, marker)
+		if index < 0 {
+			continue
+		}
+		tail := strings.TrimSpace(cleaned[index+len(marker):])
+		if tail != "" && containsHan(tail) && !weakTitle(tail) {
+			return tail
+		}
+	}
+	return ""
+}
+
+func runeLen(value string) int {
+	count := 0
+	for range value {
+		count++
+	}
+	return count
 }
 
 func weakTitle(value string) bool {
